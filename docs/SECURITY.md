@@ -27,3 +27,7 @@ This project is for a personal homelab. It does not perform automatic containmen
 ## Network Exposure
 
 The service binds to the Tailscale IP. Do not expose it directly to the public internet.
+
+Local dashboards and development helpers should bind to `127.0.0.1`. If an
+old service exposes a helper dashboard on `0.0.0.0:8765`, disable the legacy
+systemd service and rerun the posture scan before accepting the machine as clean.
