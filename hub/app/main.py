@@ -67,6 +67,7 @@ ALLOWED_TAILSCALE_TCP_PORTS = {
 IGNORE_TAILSCALE_EPHEMERAL_TCP_PORTS = (
     os.getenv("IGNORE_TAILSCALE_EPHEMERAL_TCP_PORTS", "true").lower() == "true"
 )
+EXPECTED_SSH_ALLOW_USERS = os.getenv("EXPECTED_SSH_ALLOW_USERS", "kyonccw")
 
 OUTPUT_UID = int(os.getenv("OUTPUT_UID", "1000"))
 OUTPUT_GID = int(os.getenv("OUTPUT_GID", "1000"))
@@ -119,6 +120,17 @@ class SecurityFinding(BaseModel):
     evidence: str
     recommendation: str
     status: str = "open"
+
+
+class NistCsfControl(BaseModel):
+    id: str
+    function: str
+    category: str
+    outcome: str
+    status: str
+    evidence: list[str] = Field(default_factory=list)
+    gap: str = ""
+    next_action: str = ""
 
 
 def now_utc() -> datetime:
@@ -554,7 +566,11 @@ def collect_security_findings() -> list[SecurityFinding]:
             "SSH keyboard-interactive authentication should be disabled.",
         ),
         ("ssh-x11-forwarding", r"^\s*X11Forwarding\s+no\s*$", "SSH X11 forwarding should be disabled."),
-        ("ssh-allow-users", r"^\s*AllowUsers\s+kyonccw\s*$", "SSH should restrict login users."),
+        (
+            "ssh-allow-users",
+            rf"^\s*AllowUsers\s+{re.escape(EXPECTED_SSH_ALLOW_USERS)}\s*$",
+            "SSH should restrict login users.",
+        ),
     ]
     for finding_id, pattern, message in ssh_expectations:
         if not config_has(pattern, ssh_config):
@@ -601,6 +617,369 @@ def severity_counts_from_findings(findings: list[SecurityFinding]) -> dict[str, 
     for finding in findings:
         counts[finding.severity] += 1
     return dict(sorted(counts.items()))
+
+
+def has_open_review_notes() -> bool:
+    return any((OPENCLAW_SECURITY_DIR / "inbox").glob("*.md"))
+
+
+def status_counts(items: list[NistCsfControl]) -> dict[str, int]:
+    counts: dict[str, int] = defaultdict(int)
+    for item in items:
+        counts[item.status] += 1
+    return dict(sorted(counts.items()))
+
+
+def control(
+    identifier: str,
+    function: str,
+    category: str,
+    outcome: str,
+    status: str,
+    evidence: list[str],
+    gap: str,
+    next_action: str,
+) -> NistCsfControl:
+    return NistCsfControl(
+        id=identifier,
+        function=function,
+        category=category,
+        outcome=outcome,
+        status=status,
+        evidence=evidence,
+        gap=gap,
+        next_action=next_action,
+    )
+
+
+def collect_nist_csf_controls(findings: list[SecurityFinding] | None = None) -> list[NistCsfControl]:
+    findings = findings if findings is not None else collect_security_findings()
+    finding_ids = {finding.id for finding in findings}
+    high_medium_findings = [finding for finding in findings if finding.severity in {"high", "medium"}]
+    listeners = read_listening_tcp_ports()
+    ssh_config = read_ssh_config_text()
+    events = read_events()
+    open_notes_exist = has_open_review_notes()
+    gateway_ok = openclaw_gateway_ok()
+    disk_usage = disk_usage_percent()
+
+    ssh_password_disabled = config_has(r"^\s*PasswordAuthentication\s+no\s*$", ssh_config)
+    ssh_root_disabled = config_has(r"^\s*PermitRootLogin\s+no\s*$", ssh_config)
+    ssh_kbd_disabled = config_has(r"^\s*KbdInteractiveAuthentication\s+no\s*$", ssh_config)
+    ssh_allow_users = config_has(rf"^\s*AllowUsers\s+{re.escape(EXPECTED_SSH_ALLOW_USERS)}\s*$", ssh_config)
+    ssh_x11_disabled = config_has(r"^\s*X11Forwarding\s+no\s*$", ssh_config)
+    risky_ports = [finding for finding in findings if finding.id.startswith("risky-port-")]
+    global_listener_findings = [finding for finding in findings if finding.id.startswith("global-listener-")]
+
+    return [
+        control(
+            "GV.OC-01",
+            "GOVERN",
+            "Organizational Context",
+            "The organizational mission is understood and informs cybersecurity risk management.",
+            "manual_review",
+            ["Homelab scope is documented in README and architecture notes."],
+            "Mission, assumptions, and risk tolerance still need an explicit owner-approved statement.",
+            "Add a short homelab risk statement covering scope, accepted exposure, and review cadence.",
+        ),
+        control(
+            "GV.RM-01",
+            "GOVERN",
+            "Risk Management Strategy",
+            "Risk management objectives are established and agreed to by stakeholders.",
+            "manual_review",
+            ["The queue separates evidence, unknowns, and human decisions."],
+            "Risk acceptance criteria are not yet formalized.",
+            "Document severity handling rules for low, medium, and high findings.",
+        ),
+        control(
+            "GV.PO-01",
+            "GOVERN",
+            "Policy",
+            "Cybersecurity policy is established based on context, strategy, and priorities.",
+            "manual_review",
+            ["Security notes and operational docs exist for the project."],
+            "There is no standalone policy document for this homelab service.",
+            "Create a lightweight policy covering secrets, Tailscale-only exposure, alert review, and backups.",
+        ),
+        control(
+            "ID.AM-01",
+            "IDENTIFY",
+            "Asset Management",
+            "Inventories of hardware managed by the organization are maintained.",
+            "warning",
+            [f"Scanner can observe {len(listeners)} listening TCP sockets on the host."],
+            "The scanner observes services but does not maintain a full hardware inventory.",
+            "Add a small asset inventory file for the GPD host, OpenClaw gateway, and key dependencies.",
+        ),
+        control(
+            "ID.AM-02",
+            "IDENTIFY",
+            "Asset Management",
+            "Inventories of software, services, and systems are maintained.",
+            "pass" if listeners else "warning",
+            [f"Listening services are recorded during each posture scan: {len(listeners)} observed."],
+            "" if listeners else "No service inventory was observed from /proc.",
+            "Keep service allowlists in .env and document accepted listeners.",
+        ),
+        control(
+            "ID.RA-01",
+            "IDENTIFY",
+            "Risk Assessment",
+            "Vulnerabilities in assets are identified, validated, and recorded.",
+            "pass" if not high_medium_findings else "fail",
+            [f"Current medium/high posture findings: {len(high_medium_findings)}."],
+            "" if not high_medium_findings else "Medium or high posture findings remain open.",
+            "Review every medium/high finding and record a human decision in OpenClaw.",
+        ),
+        control(
+            "ID.IM-01",
+            "IDENTIFY",
+            "Improvement",
+            "Improvements are identified from evaluations.",
+            "pass",
+            ["Security posture reports and OpenClaw queue are generated for review."],
+            "",
+            "Use the CSF profile gap list as the next improvement backlog.",
+        ),
+        control(
+            "PR.AA-01",
+            "PROTECT",
+            "Identity Management, Authentication, and Access Control",
+            "Identities and credentials for authorized users are managed.",
+            "pass" if ssh_allow_users else "fail",
+            ["SSH AllowUsers directive is present." if ssh_allow_users else "SSH AllowUsers directive was not found."],
+            "" if ssh_allow_users else "SSH login is not restricted to the expected user in observed config.",
+            "Restrict SSH users and validate sshd configuration before restart.",
+        ),
+        control(
+            "PR.AA-03",
+            "PROTECT",
+            "Identity Management, Authentication, and Access Control",
+            "Users, services, and hardware are authenticated.",
+            "pass" if ssh_password_disabled and ssh_kbd_disabled and ssh_root_disabled else "fail",
+            [
+                f"PasswordAuthentication no: {ssh_password_disabled}",
+                f"KbdInteractiveAuthentication no: {ssh_kbd_disabled}",
+                f"PermitRootLogin no: {ssh_root_disabled}",
+            ],
+            "" if ssh_password_disabled and ssh_kbd_disabled and ssh_root_disabled else "SSH authentication hardening is incomplete.",
+            "Keep SSH key-based access only and disable root/password-based authentication.",
+        ),
+        control(
+            "PR.PS-01",
+            "PROTECT",
+            "Platform Security",
+            "Configuration management practices are established and applied.",
+            "pass" if ssh_x11_disabled and not global_listener_findings else "fail",
+            [
+                f"X11Forwarding disabled: {ssh_x11_disabled}",
+                f"Unexpected global listeners: {len(global_listener_findings)}",
+            ],
+            "" if ssh_x11_disabled and not global_listener_findings else "Observed host configuration does not match the expected secure baseline.",
+            "Keep SSH hardening and listener allowlists under versioned configuration.",
+        ),
+        control(
+            "PR.PS-02",
+            "PROTECT",
+            "Platform Security",
+            "Software is maintained, replaced, and removed commensurate with risk.",
+            "pass" if not risky_ports else "fail",
+            [f"Risky service listeners detected: {len(risky_ports)}."],
+            "" if not risky_ports else "High-risk local services are still listening.",
+            "Remove or restrict unneeded services such as Samba, XRDP, remote desktop, or local model APIs.",
+        ),
+        control(
+            "PR.IR-03",
+            "PROTECT",
+            "Technology Infrastructure Resilience",
+            "Mechanisms are implemented to achieve resilience requirements.",
+            "warning" if disk_usage < DISK_ALERT_THRESHOLD_PERCENT else "fail",
+            [f"Disk usage is {disk_usage}% with threshold {DISK_ALERT_THRESHOLD_PERCENT}%."],
+            "Backup and restore verification is not yet automated.",
+            "Add a backup inventory and periodic restore verification note.",
+        ),
+        control(
+            "DE.CM-01",
+            "DETECT",
+            "Continuous Monitoring",
+            "Networks and network services are monitored to find potentially adverse events.",
+            "pass" if ENABLE_SECURITY_POSTURE_MONITOR else "fail",
+            [f"Security posture monitor enabled: {ENABLE_SECURITY_POSTURE_MONITOR}."],
+            "" if ENABLE_SECURITY_POSTURE_MONITOR else "Network/service posture monitoring is disabled.",
+            "Keep posture monitoring enabled and review latest.md regularly.",
+        ),
+        control(
+            "DE.CM-03",
+            "DETECT",
+            "Continuous Monitoring",
+            "Personnel activity and technology usage are monitored to find potentially adverse events.",
+            "pass" if ENABLE_AUTH_LOG_MONITOR else "fail",
+            [f"Auth log monitor enabled: {ENABLE_AUTH_LOG_MONITOR}.", f"Auth log path: {AUTH_LOG_PATH}."],
+            "" if ENABLE_AUTH_LOG_MONITOR else "SSH authentication monitoring is disabled.",
+            "Keep SSH auth log monitoring enabled and tune the failure threshold if needed.",
+        ),
+        control(
+            "DE.AE-02",
+            "DETECT",
+            "Adverse Event Analysis",
+            "Potentially adverse events are analyzed to better understand associated activities.",
+            "pass" if events or open_notes_exist else "warning",
+            [f"Recorded events: {len(events)}.", f"Open review notes exist: {open_notes_exist}."],
+            "" if events or open_notes_exist else "No event or review-note evidence exists yet.",
+            "Run a test alert and ensure OpenClaw review notes capture evidence and unknowns.",
+        ),
+        control(
+            "RS.MA-01",
+            "RESPOND",
+            "Incident Management",
+            "The incident response plan is executed in coordination with relevant parties.",
+            "warning" if open_notes_exist else "manual_review",
+            ["Review notes include human decision and final outcome sections."],
+            "There is a review workflow, but no tested incident response runbook yet.",
+            "Add a small incident runbook for SSH brute force, exposed service, and OpenClaw outage scenarios.",
+        ),
+        control(
+            "RS.AN-03",
+            "RESPOND",
+            "Incident Analysis",
+            "Analysis is performed to establish what has taken place during an incident.",
+            "pass" if open_notes_exist else "warning",
+            [f"Open review notes exist: {open_notes_exist}."],
+            "" if open_notes_exist else "No review note has been created yet.",
+            "Use review notes to separate evidence, assumptions, unknowns, and next checks.",
+        ),
+        control(
+            "RS.CO-02",
+            "RESPOND",
+            "Incident Response Reporting and Communication",
+            "Internal and external stakeholders are notified of incidents.",
+            "pass" if ENABLE_TELEGRAM and TELEGRAM_CHAT_ID else "warning",
+            [f"Telegram enabled: {ENABLE_TELEGRAM}.", f"Telegram chat configured: {bool(TELEGRAM_CHAT_ID)}."],
+            "" if ENABLE_TELEGRAM and TELEGRAM_CHAT_ID else "Mobile alerting is not fully configured.",
+            "Keep Telegram alerting enabled for medium/high alerts and daily briefing tests.",
+        ),
+        control(
+            "RC.RP-01",
+            "RECOVER",
+            "Incident Recovery Plan Execution",
+            "The recovery portion of the incident response plan is executed once initiated.",
+            "manual_review",
+            ["No automatic recovery action is intentionally performed by this project."],
+            "Recovery runbooks and restore tests are not yet documented in the generated evidence.",
+            "Document recovery steps for disabling bad services, restoring OpenClaw workspace files, and returning to normal state.",
+        ),
+        control(
+            "RC.RP-03",
+            "RECOVER",
+            "Incident Recovery Plan Execution",
+            "The integrity of backups and restoration assets is verified before restoration.",
+            "manual_review",
+            ["The project records reports and queue files, but does not verify backups."],
+            "Backup integrity verification is outside the current MVP.",
+            "Add a scheduled backup check and record restore-test evidence in OpenClaw reports.",
+        ),
+    ]
+
+
+def nist_csf_tier_note(controls: list[NistCsfControl]) -> str:
+    counts = status_counts(controls)
+    if counts.get("fail", 0):
+        return "Tier 1 to Tier 2: some repeatable technical practices exist, but open failures need review."
+    if counts.get("manual_review", 0) > counts.get("pass", 0):
+        return "Tier 2: risk-informed technical monitoring exists, with governance and recovery evidence still informal."
+    return "Tier 2 moving toward Tier 3: repeatable monitoring exists; formal policy, roles, and recovery testing remain the main gaps."
+
+
+def render_nist_csf_report(controls: list[NistCsfControl]) -> str:
+    counts = status_counts(controls)
+    lines = [
+        f"# NIST CSF 2.0 Aligned Homelab Assessment - {today_slug()}",
+        "",
+        f"Generated: {now_utc().isoformat()}",
+        f"Host: {HOST_LABEL}",
+        "Framework: NIST Cybersecurity Framework (CSF) 2.0",
+        "",
+        "## Scope and Caveat",
+        "",
+        "This is a CSF-aligned self-assessment for a personal homelab security workflow. It is not a formal certification or compliance attestation.",
+        "The CSF is outcome-oriented, so this report records current evidence, gaps, and next actions rather than treating the framework as a simple checklist.",
+        "",
+        "## Summary",
+        "",
+        f"- Controls assessed: {len(controls)}",
+        f"- Status counts: {json.dumps(counts, ensure_ascii=False)}",
+        f"- Tier note: {nist_csf_tier_note(controls)}",
+        "",
+        "## Function Coverage",
+        "",
+    ]
+    by_function: dict[str, list[NistCsfControl]] = defaultdict(list)
+    for item in controls:
+        by_function[item.function].append(item)
+    for function, items in sorted(by_function.items()):
+        lines.append(f"- {function}: {len(items)} checks")
+
+    lines.extend(["", "## Checks", ""])
+    for item in controls:
+        lines.extend(
+            [
+                f"### {item.id} - {item.function} / {item.category}",
+                "",
+                f"- Status: `{item.status}`",
+                f"- Outcome: {item.outcome}",
+                f"- Gap: {item.gap or 'No current gap from available evidence.'}",
+                f"- Next action: {item.next_action}",
+                "- Evidence:",
+                *(f"  - {evidence}" for evidence in item.evidence),
+                "",
+            ]
+        )
+    return "\n".join(lines) + "\n"
+
+
+def write_nist_csf_outputs(controls: list[NistCsfControl]) -> dict[str, Any]:
+    ensure_dirs()
+    report_path = OPENCLAW_SECURITY_DIR / "reports" / f"{today_slug()}-nist-csf-2.0-profile.md"
+    profile_path = OPENCLAW_SECURITY_DIR / "queue" / "nist-csf-profile.json"
+    data = {
+        "updated_at": now_utc().isoformat(),
+        "framework": "NIST CSF 2.0",
+        "status_counts": status_counts(controls),
+        "tier_note": nist_csf_tier_note(controls),
+        "controls": [item.model_dump() for item in controls],
+        "report": report_path.name,
+    }
+    write_text_owned(report_path, render_nist_csf_report(controls))
+    write_text_owned(profile_path, json.dumps(data, indent=2, ensure_ascii=False))
+    queue_path = OPENCLAW_SECURITY_DIR / "queue" / "queue.json"
+    if queue_path.exists():
+        queue = json.loads(queue_path.read_text(encoding="utf-8"))
+        queue.update(
+            {
+                "nist_csf_profile": profile_path.name,
+                "nist_csf_report": report_path.name,
+                "nist_csf_status_counts": data["status_counts"],
+                "nist_csf_tier_note": data["tier_note"],
+            }
+        )
+        write_text_owned(queue_path, json.dumps(queue, indent=2, ensure_ascii=False))
+    return {"report": str(report_path), "profile": str(profile_path), "status_counts": data["status_counts"], "tier_note": data["tier_note"]}
+
+
+def process_nist_csf_scan() -> dict[str, Any]:
+    findings = collect_security_findings()
+    write_security_posture_outputs(findings)
+    controls = collect_nist_csf_controls(findings)
+    outputs = write_nist_csf_outputs(controls)
+    return {
+        "ok": True,
+        "framework": "NIST CSF 2.0",
+        "control_count": len(controls),
+        "status_counts": status_counts(controls),
+        "tier_note": nist_csf_tier_note(controls),
+        "outputs": outputs,
+    }
 
 
 def render_security_report(findings: list[SecurityFinding]) -> str:
@@ -718,6 +1097,8 @@ def generate_daily_briefing(send_to_telegram: bool = False) -> Path:
     events = [event for event in read_events() if str(event.get("created_at", "")).startswith(date)]
     findings = collect_security_findings()
     posture_outputs = write_security_posture_outputs(findings)
+    nist_controls = collect_nist_csf_controls(findings)
+    nist_outputs = write_nist_csf_outputs(nist_controls)
     severity_counts: dict[str, int] = defaultdict(int)
     category_counts: dict[str, int] = defaultdict(int)
     for event in events:
@@ -735,9 +1116,11 @@ def generate_daily_briefing(send_to_telegram: bool = False) -> Path:
         f"- Events today: {len(events)}",
         f"- Open review notes: {len(open_notes)}",
         f"- Security posture findings: {len(findings)}",
+        f"- NIST CSF status counts: {json.dumps(status_counts(nist_controls), ensure_ascii=False)}",
         f"- OpenClaw gateway reachable: {openclaw_gateway_ok()}",
         f"- Disk usage: {disk_usage_percent()}%",
         f"- Security queue: `{Path(str(posture_outputs['queue'])).name}`",
+        f"- NIST CSF profile: `{Path(str(nist_outputs['profile'])).name}`",
         "",
         "## Severity Counts",
         "",
@@ -759,6 +1142,10 @@ def generate_daily_briefing(send_to_telegram: bool = False) -> Path:
             lines.append(f"- [{finding.severity}] {finding.title} (`{finding.id}`)")
     else:
         lines.append("- No current posture findings.")
+
+    lines.extend(["", "## NIST CSF 2.0 Review", ""])
+    lines.append(f"- Tier note: {nist_csf_tier_note(nist_controls)}")
+    lines.append("- Manual review items are expected because governance and recovery outcomes need human evidence.")
 
     lines.extend(["", "## Latest Events", ""])
     if events:
@@ -995,6 +1382,7 @@ async def index() -> dict[str, Any]:
             "generic_webhook": "/webhook/generic",
             "daily_briefing": "/briefing/daily",
             "security_scan": "/scan/security",
+            "nist_csf_scan": "/scan/nist-csf",
             "openclaw_queue": "/queue",
         },
         "openclaw_workspace": str(OPENCLAW_SECURITY_DIR),
@@ -1022,10 +1410,14 @@ async def status() -> dict[str, Any]:
     open_notes = list((OPENCLAW_SECURITY_DIR / "inbox").glob("*.md"))
     queue_path = OPENCLAW_SECURITY_DIR / "queue" / "queue.json"
     queue = json.loads(queue_path.read_text(encoding="utf-8")) if queue_path.exists() else None
+    nist_profile_path = OPENCLAW_SECURITY_DIR / "queue" / "nist-csf-profile.json"
+    nist_profile = json.loads(nist_profile_path.read_text(encoding="utf-8")) if nist_profile_path.exists() else None
     return {
         "events": len(events),
         "open_review_notes": len(open_notes),
         "security_findings": queue.get("finding_count", 0) if queue else None,
+        "nist_csf_status_counts": nist_profile.get("status_counts") if nist_profile else None,
+        "nist_csf_tier_note": nist_profile.get("tier_note") if nist_profile else None,
         "openclaw_gateway_ok": openclaw_gateway_ok(),
         "disk_usage_percent": disk_usage_percent(),
         "latest_event": events[-1] if events else None,
@@ -1055,6 +1447,12 @@ async def daily_briefing(
 async def security_scan(x_security_hub_secret: str | None = Header(default=None)) -> dict[str, Any]:
     require_secret(x_security_hub_secret)
     return process_security_posture_scan()
+
+
+@app.post("/scan/nist-csf")
+async def nist_csf_scan(x_security_hub_secret: str | None = Header(default=None)) -> dict[str, Any]:
+    require_secret(x_security_hub_secret)
+    return process_nist_csf_scan()
 
 
 @app.get("/queue")

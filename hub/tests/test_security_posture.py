@@ -139,3 +139,61 @@ def test_write_security_posture_outputs_creates_queue(tmp_path, monkeypatch) -> 
     assert queue["findings"][0]["id"] == "example"
     assert (security_dir / "latest.md").exists()
     assert (dashboard_dir / "security-alerts.json").exists()
+
+
+def test_collect_nist_csf_controls_covers_all_functions(monkeypatch) -> None:
+    monkeypatch.setattr(main, "read_listening_tcp_ports", lambda: [{"address": "100.77.103.17", "port": 8099}])
+    monkeypatch.setattr(
+        main,
+        "read_ssh_config_text",
+        lambda: "\n".join(
+            [
+                "PasswordAuthentication no",
+                "PermitRootLogin no",
+                "KbdInteractiveAuthentication no",
+                "X11Forwarding no",
+                "AllowUsers kyonccw",
+            ]
+        ),
+    )
+    monkeypatch.setattr(main, "read_events", lambda: [{"title": "example"}])
+    monkeypatch.setattr(main, "has_open_review_notes", lambda: True)
+    monkeypatch.setattr(main, "disk_usage_percent", lambda: 20.0)
+    monkeypatch.setattr(main, "openclaw_gateway_ok", lambda: True)
+
+    controls = main.collect_nist_csf_controls([])
+    functions = {control.function for control in controls}
+
+    assert functions == {"GOVERN", "IDENTIFY", "PROTECT", "DETECT", "RESPOND", "RECOVER"}
+    assert any(control.id == "DE.CM-01" and control.status == "pass" for control in controls)
+    assert any(control.status == "manual_review" for control in controls)
+
+
+def test_write_nist_csf_outputs_creates_profile_and_updates_queue(tmp_path, monkeypatch) -> None:
+    security_dir = tmp_path / "security-alerts"
+    dashboard_dir = tmp_path / "dashboard"
+    monkeypatch.setattr(main, "OPENCLAW_SECURITY_DIR", security_dir)
+    monkeypatch.setattr(main, "OPENCLAW_DASHBOARD_DIR", dashboard_dir)
+    main.ensure_dirs()
+    queue_path = security_dir / "queue" / "queue.json"
+    queue_path.write_text(json.dumps({"finding_count": 0}), encoding="utf-8")
+
+    controls = [
+        main.NistCsfControl(
+            id="DE.CM-01",
+            function="DETECT",
+            category="Continuous Monitoring",
+            outcome="Networks and services are monitored.",
+            status="pass",
+            evidence=["example"],
+            next_action="keep monitoring",
+        )
+    ]
+
+    outputs = main.write_nist_csf_outputs(controls)
+    profile = json.loads(Path(outputs["profile"]).read_text(encoding="utf-8"))
+    queue = json.loads(queue_path.read_text(encoding="utf-8"))
+
+    assert profile["framework"] == "NIST CSF 2.0"
+    assert profile["status_counts"]["pass"] == 1
+    assert queue["nist_csf_profile"] == "nist-csf-profile.json"

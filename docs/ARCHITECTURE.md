@@ -13,6 +13,7 @@ The Security Hub does not try to decide whether an event is safe or malicious. I
 | SSH monitor | Detects repeated failed SSH logins |
 | Disk monitor | Warns about high disk usage |
 | Security posture monitor | Checks host listeners, SSH hardening, disk usage, and OpenClaw reachability |
+| NIST CSF profile generator | Maps available evidence to a CSF 2.0-aligned current profile |
 | Telegram | Sends short mobile alerts |
 | OpenClaw review inbox | Stores structured investigation notes |
 | OpenClaw queue | Stores the current security work list for OpenClaw |
@@ -42,7 +43,9 @@ OpenClaw does not need direct control over host services to participate in the w
 | `security-alerts/inbox/*.md` | Individual review notes |
 | `security-alerts/latest.md` | Current summary for fast review |
 | `security-alerts/queue/queue.json` | Machine-readable work queue |
+| `security-alerts/queue/nist-csf-profile.json` | Machine-readable NIST CSF 2.0 profile |
 | `security-alerts/reports/*-security-posture.md` | Host posture reports |
+| `security-alerts/reports/*-nist-csf-2.0-profile.md` | NIST CSF aligned self-assessment |
 | `security-alerts/briefings/*.md` | Daily summaries |
 | `dashboard/security-alerts.json` | Dashboard feed |
 
@@ -54,6 +57,21 @@ The intended flow is:
 4. A human records the final decision before closing the event.
 
 This keeps automation useful without letting it silently declare an event safe or malicious.
+
+## NIST CSF 2.0 Profile Model
+
+The CSF module follows the framework's outcome-oriented structure:
+
+- Function
+- Category
+- Subcategory outcome
+- Current evidence
+- Gap
+- Next action
+
+The output is a homelab self-assessment, not a formal compliance report. Technical outcomes such as SSH hardening, service exposure, monitoring, and alert review are checked automatically where possible. Governance, policy, supplier, and recovery outcomes are marked as `manual_review` when they require human-owned evidence.
+
+This design keeps the project close to industry practice: it uses CSF as a shared risk language and profile mechanism, while avoiding the false claim that a small tool can fully certify CSF adoption.
 
 ## Port Scan Tuning
 

@@ -32,6 +32,12 @@ scripts/test-alert.sh
 scripts/generate-briefing.sh
 ```
 
+## Run NIST CSF Self-Assessment
+
+```bash
+scripts/nist-csf-check.sh
+```
+
 ## Logs
 
 ```bash
