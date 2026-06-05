@@ -268,3 +268,90 @@ def test_security_posture_queue_preserves_existing_nist_fields(tmp_path, monkeyp
     assert queue["nist_csf_profile"] == "nist-csf-profile.json"
     assert queue["nist_csf_gap_count"] == 1
     assert queue["nist_csf_tier_note"] == "example tier"
+
+
+def test_create_remediation_request_updates_queue(tmp_path, monkeypatch) -> None:
+    security_dir = tmp_path / "security-alerts"
+    dashboard_dir = tmp_path / "dashboard"
+    monkeypatch.setattr(main, "OPENCLAW_SECURITY_DIR", security_dir)
+    monkeypatch.setattr(main, "OPENCLAW_DASHBOARD_DIR", dashboard_dir)
+    main.ensure_dirs()
+
+    request = main.create_remediation_request(
+        action="disable_legacy_dashboard_service",
+        evidence=["0.0.0.0:8765"],
+        created_by="test",
+    )
+    queue = json.loads((security_dir / "queue" / "queue.json").read_text(encoding="utf-8"))
+
+    assert request.status == "pending"
+    assert request.executor == "host_runner"
+    assert queue["remediation_pending_count"] == 1
+    assert queue["remediation_pending"][0]["action"] == "disable_legacy_dashboard_service"
+
+
+def test_approve_hub_remediation_executes_and_verifies(tmp_path, monkeypatch) -> None:
+    security_dir = tmp_path / "security-alerts"
+    dashboard_dir = tmp_path / "dashboard"
+    monkeypatch.setattr(main, "OPENCLAW_SECURITY_DIR", security_dir)
+    monkeypatch.setattr(main, "OPENCLAW_DASHBOARD_DIR", dashboard_dir)
+    monkeypatch.setattr(main, "execute_hub_remediation", lambda action: {"ok": True, "action": action})
+    monkeypatch.setattr(main, "process_security_posture_scan", lambda: {"ok": True, "finding_count": 0})
+    monkeypatch.setattr(main, "process_nist_csf_scan", lambda: {"ok": True, "gap_count": 0})
+    main.ensure_dirs()
+
+    request = main.create_remediation_request(action="security_scan", created_by="test")
+    approved = main.approve_remediation_request(request.id, approved_by="test")
+
+    assert approved["status"] == "executed"
+    assert approved["result"]["verification"]["security"]["finding_count"] == 0
+
+
+def test_harden_command_creates_allowlisted_request_and_codex_task(tmp_path, monkeypatch) -> None:
+    security_dir = tmp_path / "security-alerts"
+    dashboard_dir = tmp_path / "dashboard"
+    monkeypatch.setattr(main, "OPENCLAW_SECURITY_DIR", security_dir)
+    monkeypatch.setattr(main, "OPENCLAW_DASHBOARD_DIR", dashboard_dir)
+    monkeypatch.setattr(main, "openclaw_gateway_ok", lambda: True)
+    monkeypatch.setattr(main, "disk_usage_percent", lambda: 10.0)
+    monkeypatch.setattr(main, "read_listening_tcp_ports", lambda: [])
+    monkeypatch.setattr(
+        main,
+        "collect_security_findings",
+        lambda: [
+            main.SecurityFinding(
+                id="global-listener-8765",
+                severity="medium",
+                title="TCP port 8765 listens on all interfaces",
+                evidence="0.0.0.0:8765",
+                recommendation="Bind to localhost.",
+            )
+        ],
+    )
+    main.ensure_dirs()
+
+    response = main.handle_telegram_command("/harden", chat_id="1", username="tester")
+    requests = json.loads((security_dir / "queue" / "remediation-requests.json").read_text(encoding="utf-8"))
+    codex_tasks = list((security_dir / "codex-automation" / "pending").glob("*.md"))
+
+    assert "Created 1 remediation request" in response
+    assert requests[0]["action"] == "disable_legacy_dashboard_service"
+    assert codex_tasks
+
+
+def test_codex_automation_task_contains_guardrails(tmp_path, monkeypatch) -> None:
+    security_dir = tmp_path / "security-alerts"
+    dashboard_dir = tmp_path / "dashboard"
+    monkeypatch.setattr(main, "OPENCLAW_SECURITY_DIR", security_dir)
+    monkeypatch.setattr(main, "OPENCLAW_DASHBOARD_DIR", dashboard_dir)
+    monkeypatch.setattr(main, "openclaw_gateway_ok", lambda: True)
+    monkeypatch.setattr(main, "disk_usage_percent", lambda: 10.0)
+    monkeypatch.setattr(main, "read_listening_tcp_ports", lambda: [])
+    main.ensure_dirs()
+    main.write_security_posture_outputs([])
+
+    task = main.create_codex_automation_task("test", created_by="test")
+    prompt = Path(task["prompt"]).read_text(encoding="utf-8")
+
+    assert "Do not execute arbitrary shell commands." in prompt
+    assert "Pending Remediation Requests" in prompt

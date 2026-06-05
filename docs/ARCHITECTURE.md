@@ -15,6 +15,10 @@ The Security Hub does not try to decide whether an event is safe or malicious. I
 | Security posture monitor | Checks host listeners, SSH hardening, disk usage, and OpenClaw reachability |
 | NIST CSF profile generator | Maps available evidence to a CSF 2.0-aligned Current/Target Profile and gap backlog |
 | Telegram | Sends short mobile alerts |
+| Telegram command monitor | Receives scan, harden, approve, queue, briefing, and Codex task commands |
+| Remediation approval queue | Stores allowlisted hardening requests before execution |
+| Host remediation runner | Executes approved host actions only from a fixed playbook list |
+| Codex automation task queue | Creates structured prompts for Codex review and follow-up |
 | OpenClaw review inbox | Stores structured investigation notes |
 | OpenClaw queue | Stores the current security work list for OpenClaw |
 | Daily briefing | Summarizes events and open review work |
@@ -45,6 +49,9 @@ OpenClaw does not need direct control over host services to participate in the w
 | `security-alerts/queue/queue.json` | Machine-readable work queue |
 | `security-alerts/queue/nist-csf-profile.json` | Machine-readable NIST CSF 2.0 profile |
 | `security-alerts/queue/nist-csf-gap-backlog.json` | Prioritized CSF gap backlog |
+| `security-alerts/queue/remediation-requests.json` | Pending, approved, and executed remediation requests |
+| `security-alerts/queue/remediation-results.jsonl` | Execution results from the hub or host runner |
+| `security-alerts/codex-automation/pending/*` | Codex task prompts and payloads created from the queue |
 | `security-alerts/reports/*-security-posture.md` | Host posture reports |
 | `security-alerts/reports/*-nist-csf-2.0-profile.md` | NIST CSF aligned self-assessment |
 | `security-alerts/briefings/*.md` | Daily summaries |
@@ -56,8 +63,27 @@ The intended flow is:
 2. It writes evidence and open questions into the OpenClaw workspace.
 3. OpenClaw reads the queue and helps draft review notes or next checks.
 4. A human records the final decision before closing the event.
+5. If a fix is allowlisted, Telegram or the API can create a remediation request.
+6. Approved host-level requests are executed by the host runner, followed by security and NIST verification scans.
 
 This keeps automation useful without letting it silently declare an event safe or malicious.
+
+## Remediation Guardrails
+
+The system does not execute free-form commands from Telegram, OpenClaw, or Codex.
+Every action must match a known playbook name. Low-risk scans can run from the hub.
+Host-level changes are marked for the host runner and require approval first.
+
+Current playbook categories:
+
+- Security and NIST scans.
+- Daily briefing generation.
+- Legacy dashboard service disablement.
+- OpenClaw gateway restart.
+- Local model service stop.
+
+Codex automation task files are advisory inputs. They can summarize risk and propose
+next actions, but they do not bypass the approval queue or the host runner.
 
 ## NIST CSF 2.0 Profile Model
 

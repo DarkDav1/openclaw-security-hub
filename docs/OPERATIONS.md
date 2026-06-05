@@ -38,6 +38,48 @@ scripts/generate-briefing.sh
 scripts/nist-csf-check.sh
 ```
 
+## Create Codex Automation Task
+
+```bash
+scripts/codex-automation.sh manual-review
+```
+
+Generated task files are written to:
+
+```text
+~/.openclaw/workspace/security-alerts/codex-automation/pending/
+```
+
+## Telegram Command Mode
+
+Enable command polling in `.env`:
+
+```text
+ENABLE_TELEGRAM_COMMANDS=true
+```
+
+Available commands:
+
+```text
+/scan
+/harden
+/queue
+/approve <request-id>
+/codex
+/briefing
+```
+
+## Run Approved Remediation
+
+The host runner executes only approved, allowlisted host actions.
+
+```bash
+scripts/remediation-runner.py
+```
+
+If a playbook needs sudo and sudo is not already validated, the request remains
+in `needs_sudo` status. Run `sudo -v`, then run the host runner again.
+
 ## Disable Legacy Dashboard Service
 
 If the posture scan reports a globally exposed dashboard listener on port `8765`,

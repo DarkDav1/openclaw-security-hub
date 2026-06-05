@@ -29,6 +29,8 @@ WEBHOOK_SECRET = os.getenv("SECURITY_HUB_WEBHOOK_SECRET", "")
 ENABLE_TELEGRAM = os.getenv("ENABLE_TELEGRAM", "false").lower() == "true"
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+ENABLE_TELEGRAM_COMMANDS = os.getenv("ENABLE_TELEGRAM_COMMANDS", "false").lower() == "true"
+TELEGRAM_COMMAND_POLL_SECONDS = int(os.getenv("TELEGRAM_COMMAND_POLL_SECONDS", "5"))
 
 HOST_LABEL = os.getenv("HOST_LABEL", "homelab")
 OPENCLAW_GATEWAY_URL = os.getenv("OPENCLAW_GATEWAY_URL", "http://127.0.0.1:18789")
@@ -79,6 +81,45 @@ openclaw_last_alert_at: datetime | None = None
 disk_last_alert_at: datetime | None = None
 security_posture_last_alert_at: datetime | None = None
 
+REMEDIATION_PLAYBOOKS = {
+    "security_scan": {
+        "title": "Run security posture scan",
+        "executor": "hub",
+        "risk": "low",
+        "approval_required": False,
+    },
+    "nist_csf_scan": {
+        "title": "Run NIST CSF self-assessment",
+        "executor": "hub",
+        "risk": "low",
+        "approval_required": False,
+    },
+    "daily_briefing": {
+        "title": "Generate daily briefing",
+        "executor": "hub",
+        "risk": "low",
+        "approval_required": False,
+    },
+    "disable_legacy_dashboard_service": {
+        "title": "Disable legacy dashboard service",
+        "executor": "host_runner",
+        "risk": "medium",
+        "approval_required": True,
+    },
+    "restart_openclaw_gateway": {
+        "title": "Restart OpenClaw gateway",
+        "executor": "host_runner",
+        "risk": "medium",
+        "approval_required": True,
+    },
+    "stop_ollama_service": {
+        "title": "Stop local model service",
+        "executor": "host_runner",
+        "risk": "medium",
+        "approval_required": True,
+    },
+}
+
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
@@ -88,6 +129,7 @@ async def lifespan(_: FastAPI):
         asyncio.create_task(openclaw_monitor()),
         asyncio.create_task(disk_monitor()),
         asyncio.create_task(security_posture_monitor()),
+        asyncio.create_task(telegram_command_monitor()),
     ]
     try:
         yield
@@ -138,6 +180,31 @@ class NistCsfControl(BaseModel):
     next_action: str = ""
 
 
+class RemediationRequest(BaseModel):
+    id: str
+    action: str
+    title: str
+    status: str = "pending"
+    risk: str = "medium"
+    executor: str = "host_runner"
+    approval_required: bool = True
+    created_at: str
+    created_by: str = "security-hub"
+    approved_at: str | None = None
+    approved_by: str | None = None
+    executed_at: str | None = None
+    evidence: list[str] = Field(default_factory=list)
+    verification: list[str] = Field(default_factory=lambda: ["security_scan", "nist_csf_scan"])
+    result: dict[str, Any] = Field(default_factory=dict)
+
+
+class RemediationCreate(BaseModel):
+    action: str
+    title: str | None = None
+    evidence: list[str] = Field(default_factory=list)
+    created_by: str = "api"
+
+
 def now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -160,7 +227,7 @@ def normalize_list(value: Any) -> list[str]:
 
 
 def ensure_dirs() -> None:
-    for subdir in ["inbox", "briefings", "events", "reports", "queue"]:
+    for subdir in ["inbox", "briefings", "events", "reports", "queue", "codex-automation/pending"]:
         (OPENCLAW_SECURITY_DIR / subdir).mkdir(parents=True, exist_ok=True)
     OPENCLAW_DASHBOARD_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -185,6 +252,108 @@ def append_jsonl(path: Path, item: dict[str, Any]) -> None:
     with path.open("a", encoding="utf-8") as file:
         file.write(json.dumps(item, ensure_ascii=False) + "\n")
     chown_if_possible(path)
+
+
+def read_json_owned(path: Path, default: Any) -> Any:
+    if not path.exists():
+        return default
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return default
+
+
+def write_json_owned(path: Path, item: Any) -> None:
+    write_text_owned(path, json.dumps(item, indent=2, ensure_ascii=False))
+
+
+def remediation_requests_path() -> Path:
+    return OPENCLAW_SECURITY_DIR / "queue" / "remediation-requests.json"
+
+
+def remediation_results_path() -> Path:
+    return OPENCLAW_SECURITY_DIR / "queue" / "remediation-results.jsonl"
+
+
+def read_remediation_requests() -> list[dict[str, Any]]:
+    data = read_json_owned(remediation_requests_path(), [])
+    return data if isinstance(data, list) else []
+
+
+def write_remediation_requests(items: list[dict[str, Any]]) -> None:
+    write_json_owned(remediation_requests_path(), items)
+
+
+def remediation_request_id(action: str) -> str:
+    return f"{now_utc().strftime('%Y%m%d-%H%M%S')}-{slugify(action)}"
+
+
+def create_remediation_request(
+    action: str,
+    title: str | None = None,
+    evidence: list[str] | None = None,
+    created_by: str = "security-hub",
+) -> RemediationRequest:
+    if action not in REMEDIATION_PLAYBOOKS:
+        raise HTTPException(status_code=400, detail=f"Unsupported remediation action: {action}")
+    playbook = REMEDIATION_PLAYBOOKS[action]
+    request = RemediationRequest(
+        id=remediation_request_id(action),
+        action=action,
+        title=title or str(playbook["title"]),
+        status="pending" if playbook["approval_required"] else "approved",
+        risk=str(playbook["risk"]),
+        executor=str(playbook["executor"]),
+        approval_required=bool(playbook["approval_required"]),
+        created_at=now_utc().isoformat(),
+        created_by=created_by,
+        evidence=evidence or [],
+    )
+    items = read_remediation_requests()
+    items.append(request.model_dump())
+    write_remediation_requests(items)
+    update_queue_remediation_fields()
+    return request
+
+
+def update_remediation_request(request_id: str, updates: dict[str, Any]) -> dict[str, Any]:
+    items = read_remediation_requests()
+    for index, item in enumerate(items):
+        if item.get("id") == request_id:
+            item.update(updates)
+            items[index] = item
+            write_remediation_requests(items)
+            update_queue_remediation_fields()
+            return item
+    raise HTTPException(status_code=404, detail="Remediation request not found")
+
+
+def update_queue_remediation_fields() -> None:
+    queue_path = OPENCLAW_SECURITY_DIR / "queue" / "queue.json"
+    queue = read_json_owned(queue_path, {})
+    if not isinstance(queue, dict):
+        queue = {}
+    requests = read_remediation_requests()
+    pending = [item for item in requests if item.get("status") in {"pending", "approved", "needs_host_runner", "needs_sudo"}]
+    queue.update(
+        {
+            "remediation_request_count": len(requests),
+            "remediation_pending_count": len(pending),
+            "remediation_requests": remediation_requests_path().name,
+            "remediation_pending": [
+                {
+                    "id": item.get("id"),
+                    "action": item.get("action"),
+                    "status": item.get("status"),
+                    "risk": item.get("risk"),
+                    "executor": item.get("executor"),
+                    "title": item.get("title"),
+                }
+                for item in pending[-20:]
+            ],
+        }
+    )
+    write_json_owned(queue_path, queue)
 
 
 def alert_from_payload(payload: dict[str, Any]) -> Alert:
@@ -324,8 +493,6 @@ def write_dashboard(events: list[dict[str, Any]]) -> None:
 
 
 def send_telegram(alert: Alert, note_path: Path) -> bool:
-    if not ENABLE_TELEGRAM or not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        return False
     text = (
         f"[OPENCLAW SECURITY] {alert.title}\n\n"
         f"Source: {alert.source}\n"
@@ -333,7 +500,13 @@ def send_telegram(alert: Alert, note_path: Path) -> bool:
         f"Summary: {alert.summary or 'No summary supplied.'}\n"
         f"Review note: {note_path.name}"
     )
-    payload = json.dumps({"chat_id": TELEGRAM_CHAT_ID, "text": text}).encode("utf-8")
+    return send_telegram_text(text)
+
+
+def send_telegram_text(text: str, chat_id: str | None = None) -> bool:
+    if not ENABLE_TELEGRAM or not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return False
+    payload = json.dumps({"chat_id": chat_id or TELEGRAM_CHAT_ID, "text": text}).encode("utf-8")
     request = urllib.request.Request(
         f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
         data=payload,
@@ -345,6 +518,23 @@ def send_telegram(alert: Alert, note_path: Path) -> bool:
             return response.status == 200
     except urllib.error.URLError:
         return False
+
+
+def telegram_api(method: str, payload: dict[str, Any] | None = None, timeout: int = 35) -> dict[str, Any]:
+    if not TELEGRAM_BOT_TOKEN:
+        return {"ok": False, "description": "Telegram token is not configured."}
+    data = json.dumps(payload or {}).encode("utf-8")
+    request = urllib.request.Request(
+        f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/{method}",
+        data=data,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except (urllib.error.URLError, json.JSONDecodeError) as exc:
+        return {"ok": False, "description": str(exc)}
 
 
 def process_alert(alert: Alert) -> dict[str, Any]:
@@ -1179,6 +1369,7 @@ def write_security_posture_outputs(findings: list[SecurityFinding]) -> dict[str,
     queue.update({key: value for key, value in existing_nist_queue_fields().items() if value is not None})
     queue_path = OPENCLAW_SECURITY_DIR / "queue" / "queue.json"
     write_text_owned(queue_path, json.dumps(queue, indent=2, ensure_ascii=False))
+    update_queue_remediation_fields()
 
     latest_lines = [
         "# OpenClaw Security Queue",
@@ -1222,6 +1413,298 @@ def process_security_posture_scan() -> dict[str, Any]:
         "severity_counts": severity_counts_from_findings(findings),
         "outputs": outputs,
     }
+
+
+def execute_hub_remediation(action: str) -> dict[str, Any]:
+    if action == "security_scan":
+        return process_security_posture_scan()
+    if action == "nist_csf_scan":
+        return process_nist_csf_scan()
+    if action == "daily_briefing":
+        path = generate_daily_briefing(send_to_telegram=False)
+        return {"ok": True, "briefing": str(path)}
+    raise HTTPException(status_code=400, detail=f"Action cannot be executed by hub: {action}")
+
+
+def approve_remediation_request(request_id: str, approved_by: str = "api") -> dict[str, Any]:
+    items = read_remediation_requests()
+    request_item = next((item for item in items if item.get("id") == request_id), None)
+    if request_item is None:
+        raise HTTPException(status_code=404, detail="Remediation request not found")
+    if request_item.get("status") not in {"pending", "approved", "needs_host_runner", "needs_sudo"}:
+        raise HTTPException(status_code=409, detail=f"Request is already {request_item.get('status')}")
+    if request_item.get("action") not in REMEDIATION_PLAYBOOKS:
+        raise HTTPException(status_code=400, detail="Request action is not allowlisted")
+
+    approved = update_remediation_request(
+        request_id,
+        {
+            "status": "approved",
+            "approved_at": now_utc().isoformat(),
+            "approved_by": approved_by,
+        },
+    )
+    if approved.get("executor") == "hub":
+        result = execute_hub_remediation(str(approved["action"]))
+        verification = {
+            "security": process_security_posture_scan(),
+            "nist_csf": process_nist_csf_scan(),
+        }
+        executed = update_remediation_request(
+            request_id,
+            {
+                "status": "executed",
+                "executed_at": now_utc().isoformat(),
+                "result": {"action": result, "verification": verification},
+            },
+        )
+        append_jsonl(remediation_results_path(), executed)
+        return executed
+
+    waiting = update_remediation_request(
+        request_id,
+        {
+            "status": "needs_host_runner",
+            "result": {
+                "ok": True,
+                "message": "Approved. Run scripts/remediation-runner.py on the host to execute this allowlisted action.",
+            },
+        },
+    )
+    append_jsonl(remediation_results_path(), waiting)
+    return waiting
+
+
+def create_remediation_requests_from_findings(findings: list[SecurityFinding], created_by: str) -> list[dict[str, Any]]:
+    created: list[dict[str, Any]] = []
+    existing_open = {
+        (item.get("action"), tuple(item.get("evidence", [])))
+        for item in read_remediation_requests()
+        if item.get("status") in {"pending", "approved", "needs_host_runner", "needs_sudo"}
+    }
+    for finding in findings:
+        action: str | None = None
+        if finding.id == "global-listener-8765":
+            action = "disable_legacy_dashboard_service"
+        elif finding.id == "openclaw-gateway":
+            action = "restart_openclaw_gateway"
+        elif finding.id == "risky-port-11434":
+            action = "stop_ollama_service"
+        if not action:
+            continue
+        evidence = [finding.evidence, finding.recommendation]
+        key = (action, tuple(evidence))
+        if key in existing_open:
+            continue
+        request = create_remediation_request(
+            action=action,
+            title=f"{REMEDIATION_PLAYBOOKS[action]['title']}: {finding.title}",
+            evidence=evidence,
+            created_by=created_by,
+        )
+        created.append(request.model_dump())
+    return created
+
+
+def create_codex_automation_task(trigger: str, created_by: str = "security-hub") -> dict[str, Any]:
+    ensure_dirs()
+    queue = read_openclaw_queue()
+    remediation_requests = read_remediation_requests()
+    pending = [item for item in remediation_requests if item.get("status") in {"pending", "needs_host_runner", "needs_sudo"}]
+    task_id = f"{now_utc().strftime('%Y%m%d-%H%M%S')}-{slugify(trigger)}"
+    prompt_path = OPENCLAW_SECURITY_DIR / "codex-automation" / "pending" / f"{task_id}.md"
+    payload_path = OPENCLAW_SECURITY_DIR / "codex-automation" / "pending" / f"{task_id}.json"
+    prompt = f"""# Codex Security Automation Task
+
+Created: {now_utc().isoformat()}
+Created by: {created_by}
+Trigger: {trigger}
+Host: {HOST_LABEL}
+
+## Objective
+
+Review the current OpenClaw Security Hub queue, explain the active risk, and prepare the next safe action.
+
+## Guardrails
+
+- Do not execute arbitrary shell commands.
+- Use only documented playbooks from `REMEDIATION_PLAYBOOKS`.
+- Prefer evidence gathering and reports when a fix is not explicitly allowlisted.
+- For host-level changes, require an approved remediation request and the host runner.
+- After any approved action, verify with security posture and NIST CSF scans.
+
+## Current Queue Summary
+
+```json
+{json.dumps(queue, indent=2, ensure_ascii=False)}
+```
+
+## Pending Remediation Requests
+
+```json
+{json.dumps(pending, indent=2, ensure_ascii=False)}
+```
+"""
+    write_text_owned(prompt_path, prompt)
+    write_json_owned(
+        payload_path,
+        {
+            "id": task_id,
+            "created_at": now_utc().isoformat(),
+            "trigger": trigger,
+            "created_by": created_by,
+            "queue": queue,
+            "pending_remediation": pending,
+            "prompt": prompt_path.name,
+            "allowlisted_actions": sorted(REMEDIATION_PLAYBOOKS),
+        },
+    )
+    return {"ok": True, "id": task_id, "prompt": str(prompt_path), "payload": str(payload_path)}
+
+
+def format_remediation_summary(items: list[dict[str, Any]], limit: int = 8) -> str:
+    if not items:
+        return "No pending remediation requests."
+    lines = []
+    for item in items[-limit:]:
+        lines.append(
+            f"- {item.get('id')} | {item.get('status')} | {item.get('risk')} | {item.get('title')}"
+        )
+    return "\n".join(lines)
+
+
+def handle_telegram_command(text: str, chat_id: str, username: str = "telegram") -> str:
+    command = text.strip()
+    if not command:
+        return ""
+    parts = command.split()
+    verb = parts[0].split("@", 1)[0].lower()
+
+    if verb in {"/help", "/start"}:
+        return (
+            "OpenClaw Security Hub commands:\n"
+            "/scan - run security and NIST scans\n"
+            "/harden - create allowlisted remediation requests from current findings\n"
+            "/queue - show pending remediation requests\n"
+            "/approve <id> - approve a remediation request\n"
+            "/codex - create a Codex automation task file\n"
+            "/briefing - generate daily briefing"
+        )
+
+    if verb == "/scan":
+        security = process_security_posture_scan()
+        nist = process_nist_csf_scan()
+        create_codex_automation_task("telegram-scan", created_by=username)
+        return (
+            "Scan completed.\n"
+            f"Security findings: {security['finding_count']}\n"
+            f"NIST gaps: {nist['gap_count']}\n"
+            f"NIST status: {json.dumps(nist['status_counts'], ensure_ascii=False)}"
+        )
+
+    if verb == "/harden":
+        security = process_security_posture_scan()
+        findings = [
+            SecurityFinding(**item)
+            for item in security["outputs"].get("findings", [])
+            if str(item.get("severity")) in {"high", "medium"}
+        ]
+        created = create_remediation_requests_from_findings(findings, created_by=username)
+        task = create_codex_automation_task("telegram-harden", created_by=username)
+        if not created:
+            return (
+                "No new allowlisted remediation request was created.\n"
+                f"Current security findings: {security['finding_count']}\n"
+                f"Codex task: {Path(str(task['prompt'])).name}"
+            )
+        return (
+            f"Created {len(created)} remediation request(s).\n"
+            f"{format_remediation_summary(created)}\n"
+            f"Codex task: {Path(str(task['prompt'])).name}"
+        )
+
+    if verb == "/queue":
+        requests = [
+            item
+            for item in read_remediation_requests()
+            if item.get("status") in {"pending", "approved", "needs_host_runner", "needs_sudo"}
+        ]
+        return format_remediation_summary(requests)
+
+    if verb == "/approve":
+        if len(parts) < 2:
+            return "Usage: /approve <request-id>"
+        approved = approve_remediation_request(parts[1], approved_by=username)
+        return (
+            "Remediation request updated.\n"
+            f"ID: {approved.get('id')}\n"
+            f"Status: {approved.get('status')}\n"
+            f"Action: {approved.get('action')}\n"
+            f"Result: {json.dumps(approved.get('result', {}), ensure_ascii=False)}"
+        )
+
+    if verb == "/codex":
+        task = create_codex_automation_task("telegram-codex", created_by=username)
+        return f"Codex automation task created: {Path(str(task['prompt'])).name}"
+
+    if verb == "/briefing":
+        path = generate_daily_briefing(send_to_telegram=False)
+        return f"Daily briefing generated: {Path(path).name}"
+
+    return "Unknown command. Send /help for available commands."
+
+
+def read_telegram_offset() -> int:
+    path = OPENCLAW_SECURITY_DIR / "queue" / "telegram-offset.json"
+    data = read_json_owned(path, {})
+    if isinstance(data, dict):
+        return int(data.get("offset", 0) or 0)
+    return 0
+
+
+def write_telegram_offset(offset: int) -> None:
+    write_json_owned(OPENCLAW_SECURITY_DIR / "queue" / "telegram-offset.json", {"offset": offset})
+
+
+def process_telegram_update(update: dict[str, Any]) -> None:
+    message = update.get("message") or update.get("edited_message")
+    if not isinstance(message, dict):
+        return
+    chat = message.get("chat") if isinstance(message.get("chat"), dict) else {}
+    chat_id = str(chat.get("id", ""))
+    if TELEGRAM_CHAT_ID and chat_id != str(TELEGRAM_CHAT_ID):
+        return
+    text = str(message.get("text") or "").strip()
+    if not text.startswith("/"):
+        return
+    user = message.get("from") if isinstance(message.get("from"), dict) else {}
+    username = str(user.get("username") or user.get("first_name") or "telegram")
+    response = handle_telegram_command(text, chat_id=chat_id, username=username)
+    if response:
+        send_telegram_text(response, chat_id=chat_id)
+
+
+async def telegram_command_monitor() -> None:
+    if not ENABLE_TELEGRAM_COMMANDS or not ENABLE_TELEGRAM or not TELEGRAM_BOT_TOKEN:
+        return
+    ensure_dirs()
+    offset = read_telegram_offset()
+    while True:
+        try:
+            payload = {"timeout": 25, "allowed_updates": ["message", "edited_message"]}
+            if offset:
+                payload["offset"] = offset + 1
+            data = await asyncio.to_thread(telegram_api, "getUpdates", payload, 35)
+            if data.get("ok") and isinstance(data.get("result"), list):
+                for update in data["result"]:
+                    update_id = int(update.get("update_id", 0))
+                    if update_id:
+                        offset = max(offset, update_id)
+                        write_telegram_offset(offset)
+                    process_telegram_update(update)
+        except Exception as exc:
+            print(f"telegram command monitor error: {exc}", flush=True)
+        await asyncio.sleep(TELEGRAM_COMMAND_POLL_SECONDS)
 
 
 def generate_daily_briefing(send_to_telegram: bool = False) -> Path:
@@ -1519,6 +2002,9 @@ async def index() -> dict[str, Any]:
             "security_scan": "/scan/security",
             "nist_csf_scan": "/scan/nist-csf",
             "openclaw_queue": "/queue",
+            "telegram_webhook": "/telegram/webhook",
+            "remediation_requests": "/remediation/requests",
+            "codex_automation": "/automation/codex",
         },
         "openclaw_workspace": str(OPENCLAW_SECURITY_DIR),
     }
@@ -1530,6 +2016,7 @@ async def health() -> dict[str, Any]:
         "ok": True,
         "app": APP_NAME,
         "telegram_enabled": ENABLE_TELEGRAM,
+        "telegram_commands_enabled": ENABLE_TELEGRAM_COMMANDS,
         "auth_log_monitor_enabled": ENABLE_AUTH_LOG_MONITOR,
         "openclaw_monitor_enabled": ENABLE_OPENCLAW_MONITOR,
         "disk_monitor_enabled": ENABLE_DISK_MONITOR,
@@ -1551,6 +2038,7 @@ async def status() -> dict[str, Any]:
         "events": len(events),
         "open_review_notes": len(open_notes),
         "security_findings": queue.get("finding_count", 0) if queue else None,
+        "remediation_pending_count": queue.get("remediation_pending_count", 0) if queue else None,
         "nist_csf_status_counts": nist_profile.get("status_counts") if nist_profile else None,
         "nist_csf_gap_count": len(nist_profile.get("gap_backlog", [])) if nist_profile else None,
         "nist_csf_tier_note": nist_profile.get("tier_note") if nist_profile else None,
@@ -1595,6 +2083,53 @@ async def nist_csf_scan(x_security_hub_secret: str | None = Header(default=None)
 async def openclaw_queue(x_security_hub_secret: str | None = Header(default=None)) -> dict[str, Any]:
     require_secret(x_security_hub_secret)
     return read_openclaw_queue()
+
+
+@app.post("/telegram/webhook")
+async def telegram_webhook(
+    request: Request, x_security_hub_secret: str | None = Header(default=None)
+) -> dict[str, Any]:
+    require_secret(x_security_hub_secret)
+    payload = await request.json()
+    process_telegram_update(payload)
+    return {"ok": True}
+
+
+@app.get("/remediation/requests")
+async def remediation_requests(x_security_hub_secret: str | None = Header(default=None)) -> dict[str, Any]:
+    require_secret(x_security_hub_secret)
+    return {"ok": True, "requests": read_remediation_requests(), "playbooks": REMEDIATION_PLAYBOOKS}
+
+
+@app.post("/remediation/request")
+async def remediation_request(
+    body: RemediationCreate, x_security_hub_secret: str | None = Header(default=None)
+) -> dict[str, Any]:
+    require_secret(x_security_hub_secret)
+    request = create_remediation_request(
+        action=body.action,
+        title=body.title,
+        evidence=body.evidence,
+        created_by=body.created_by,
+    )
+    create_codex_automation_task(f"remediation-request-{body.action}", created_by=body.created_by)
+    return {"ok": True, "request": request.model_dump()}
+
+
+@app.post("/remediation/{request_id}/approve")
+async def remediation_approve(
+    request_id: str, x_security_hub_secret: str | None = Header(default=None)
+) -> dict[str, Any]:
+    require_secret(x_security_hub_secret)
+    return {"ok": True, "request": approve_remediation_request(request_id)}
+
+
+@app.post("/automation/codex")
+async def codex_automation(
+    x_security_hub_secret: str | None = Header(default=None), trigger: str = "api"
+) -> dict[str, Any]:
+    require_secret(x_security_hub_secret)
+    return create_codex_automation_task(trigger=trigger, created_by="api")
 
 
 def main() -> None:

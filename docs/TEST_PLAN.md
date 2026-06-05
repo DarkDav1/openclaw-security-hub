@@ -18,6 +18,8 @@ This project is tested as a homelab security workflow, not only as a web API.
   - `security-alerts/queue/nist-csf-gap-backlog.json`
   - NIST status fields in `security-alerts/queue/queue.json`
 - The daily briefing includes event counts, open review counts, and posture findings.
+- Telegram command handling can run scans, create remediation requests, approve requests, and create Codex task files.
+- The host remediation runner executes only approved, allowlisted actions and records results.
 - Unit tests pass inside the same Docker image used by the service.
 - Secrets stay in `.env` and are not committed.
 
@@ -38,6 +40,7 @@ The tests verify:
 - NIST CSF function coverage across GOVERN, IDENTIFY, PROTECT, DETECT, RESPOND, and RECOVER.
 - NIST CSF profile JSON generation.
 - NIST CSF Current/Target Profile fields and gap backlog priority sorting.
+- Remediation request creation, approval, Telegram command handling, and Codex task generation.
 
 ## Manual End-to-End Tests
 
@@ -50,6 +53,8 @@ scripts/test-alert.sh
 scripts/security-scan.sh
 scripts/nist-csf-check.sh
 scripts/generate-briefing.sh
+scripts/codex-automation.sh manual-test
+scripts/remediation-runner.py
 ```
 
 Then confirm:
