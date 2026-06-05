@@ -11,8 +11,8 @@ services:
       - /var/log/auth.log:/host/auth.log:ro
       - /proc:/host-proc:ro
       - /:/host-root:ro
-      - /home/kyonccw/.openclaw/workspace/security-alerts:/openclaw/security-alerts
-      - /home/kyonccw/.openclaw/workspace/dashboard:/openclaw/dashboard
+      - ${OPENCLAW_HOST_SECURITY_DIR:?set OPENCLAW_HOST_SECURITY_DIR in .env}:/openclaw/security-alerts
+      - ${OPENCLAW_HOST_DASHBOARD_DIR:?set OPENCLAW_HOST_DASHBOARD_DIR in .env}:/openclaw/dashboard
     healthcheck:
       test: ["CMD", "python", "-c", "import os, urllib.request; urllib.request.urlopen(f'http://{os.environ.get(\"TAILSCALE_IP\", \"127.0.0.1\")}:{os.environ.get(\"SECURITY_HUB_PORT\", \"8099\")}/health', timeout=3)"]
       interval: 30s
