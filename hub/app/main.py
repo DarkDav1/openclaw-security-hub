@@ -10,7 +10,9 @@ import urllib.request
 from collections import defaultdict, deque
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from ipaddress import IPv4Address, IPv6Address
 from pathlib import Path
+from stat import S_ISSOCK
 from typing import Any
 
 import uvicorn
@@ -47,6 +49,24 @@ ENABLE_DISK_MONITOR = os.getenv("ENABLE_DISK_MONITOR", "true").lower() == "true"
 DISK_CHECK_INTERVAL_SECONDS = int(os.getenv("DISK_CHECK_INTERVAL_SECONDS", "300"))
 DISK_ALERT_THRESHOLD_PERCENT = int(os.getenv("DISK_ALERT_THRESHOLD_PERCENT", "90"))
 HOST_ROOT_PATH = Path(os.getenv("HOST_ROOT_PATH", "/host-root"))
+HOST_PROC_PATH = Path(os.getenv("HOST_PROC_PATH", "/host-proc"))
+
+ENABLE_SECURITY_POSTURE_MONITOR = os.getenv("ENABLE_SECURITY_POSTURE_MONITOR", "true").lower() == "true"
+SECURITY_POSTURE_INTERVAL_SECONDS = int(os.getenv("SECURITY_POSTURE_INTERVAL_SECONDS", "900"))
+SECURITY_POSTURE_ALERT_COOLDOWN_SECONDS = int(os.getenv("SECURITY_POSTURE_ALERT_COOLDOWN_SECONDS", "3600"))
+ALLOWED_GLOBAL_TCP_PORTS = {
+    int(port.strip())
+    for port in os.getenv("ALLOWED_GLOBAL_TCP_PORTS", "22").split(",")
+    if port.strip().isdigit()
+}
+ALLOWED_TAILSCALE_TCP_PORTS = {
+    int(port.strip())
+    for port in os.getenv("ALLOWED_TAILSCALE_TCP_PORTS", "8099").split(",")
+    if port.strip().isdigit()
+}
+IGNORE_TAILSCALE_EPHEMERAL_TCP_PORTS = (
+    os.getenv("IGNORE_TAILSCALE_EPHEMERAL_TCP_PORTS", "true").lower() == "true"
+)
 
 OUTPUT_UID = int(os.getenv("OUTPUT_UID", "1000"))
 OUTPUT_GID = int(os.getenv("OUTPUT_GID", "1000"))
@@ -56,6 +76,7 @@ auth_last_alert: dict[str, datetime] = {}
 auth_last_lines: dict[str, list[str]] = defaultdict(list)
 openclaw_last_alert_at: datetime | None = None
 disk_last_alert_at: datetime | None = None
+security_posture_last_alert_at: datetime | None = None
 
 
 @asynccontextmanager
@@ -65,6 +86,7 @@ async def lifespan(_: FastAPI):
         asyncio.create_task(auth_log_monitor()),
         asyncio.create_task(openclaw_monitor()),
         asyncio.create_task(disk_monitor()),
+        asyncio.create_task(security_posture_monitor()),
     ]
     try:
         yield
@@ -90,6 +112,15 @@ class Alert(BaseModel):
     raw: dict[str, Any] = Field(default_factory=dict)
 
 
+class SecurityFinding(BaseModel):
+    id: str
+    severity: str
+    title: str
+    evidence: str
+    recommendation: str
+    status: str = "open"
+
+
 def now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -112,7 +143,7 @@ def normalize_list(value: Any) -> list[str]:
 
 
 def ensure_dirs() -> None:
-    for subdir in ["inbox", "briefings", "events"]:
+    for subdir in ["inbox", "briefings", "events", "reports", "queue"]:
         (OPENCLAW_SECURITY_DIR / subdir).mkdir(parents=True, exist_ok=True)
     OPENCLAW_DASHBOARD_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -333,10 +364,360 @@ def disk_usage_percent() -> float:
     return round((usage.used / usage.total) * 100, 2)
 
 
+def parse_tcp_addr(hex_ip: str, hex_port: str, version: int) -> tuple[str, int]:
+    port = int(hex_port, 16)
+    if version == 4:
+        raw = bytes.fromhex(hex_ip)
+        address = str(IPv4Address(raw[::-1]))
+    else:
+        raw = bytes.fromhex(hex_ip)
+        words = [raw[i : i + 4][::-1] for i in range(0, 16, 4)]
+        address = str(IPv6Address(b"".join(words)))
+    return address, port
+
+
+def read_process_text(path: Path) -> str:
+    try:
+        return path.read_text(encoding="utf-8", errors="replace").strip()
+    except (FileNotFoundError, PermissionError, OSError):
+        return ""
+
+
+def read_process_cmdline(path: Path) -> str:
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except (FileNotFoundError, PermissionError, OSError):
+        return ""
+    return " ".join(part for part in text.split("\x00") if part).strip()
+
+
+def build_socket_process_map() -> dict[str, dict[str, str]]:
+    process_by_inode: dict[str, dict[str, str]] = {}
+    for proc_dir in HOST_PROC_PATH.glob("[0-9]*"):
+        fd_dir = proc_dir / "fd"
+        if not fd_dir.exists():
+            continue
+        comm = read_process_text(proc_dir / "comm")
+        cmdline = read_process_cmdline(proc_dir / "cmdline")
+        cgroup = read_process_text(proc_dir / "cgroup")
+        process = {
+            "pid": proc_dir.name,
+            "comm": comm,
+            "cmdline": cmdline,
+            "cgroup": cgroup,
+        }
+        try:
+            fd_paths = list(fd_dir.iterdir())
+        except (FileNotFoundError, PermissionError, OSError):
+            continue
+        for fd_path in fd_paths:
+            try:
+                stat_result = fd_path.stat()
+                if not S_ISSOCK(stat_result.st_mode):
+                    continue
+                target = os.readlink(fd_path)
+            except (FileNotFoundError, PermissionError, OSError):
+                continue
+            match = re.fullmatch(r"socket:\[(\d+)\]", target)
+            if match:
+                process_by_inode.setdefault(match.group(1), process)
+    return process_by_inode
+
+
+def read_listening_tcp_ports() -> list[dict[str, Any]]:
+    listeners: list[dict[str, Any]] = []
+    process_by_inode = build_socket_process_map()
+    for filename, version in [("tcp", 4), ("tcp6", 6)]:
+        path = HOST_PROC_PATH / "net" / filename
+        if not path.exists():
+            continue
+        for line in path.read_text(encoding="utf-8", errors="replace").splitlines()[1:]:
+            fields = line.split()
+            if len(fields) < 4 or fields[3] != "0A":
+                continue
+            local_address = fields[1]
+            hex_ip, hex_port = local_address.split(":", 1)
+            address, port = parse_tcp_addr(hex_ip, hex_port, version)
+            inode = fields[9] if len(fields) > 9 else ""
+            listener = {
+                "address": address,
+                "port": port,
+                "family": f"tcp{version}",
+                "inode": inode,
+            }
+            if inode in process_by_inode:
+                listener["process"] = process_by_inode[inode]
+            listeners.append(listener)
+    return sorted(listeners, key=lambda item: (item["port"], item["address"]))
+
+
+def is_global_listener(address: str) -> bool:
+    return address in {"0.0.0.0", "::"}
+
+
+def is_loopback_listener(address: str) -> bool:
+    return address.startswith("127.") or address == "::1"
+
+
+def is_tailscale_listener(address: str) -> bool:
+    return address == TAILSCALE_IP or address.startswith("fd7a:115c:a1e0:")
+
+
+def is_tailscale_daemon_listener(listener: dict[str, Any]) -> bool:
+    process = listener.get("process")
+    if not isinstance(process, dict):
+        return False
+    comm = str(process.get("comm", ""))
+    cmdline = str(process.get("cmdline", ""))
+    cgroup = str(process.get("cgroup", ""))
+    return "tailscaled" in {comm, Path(cmdline.split(" ", 1)[0]).name if cmdline else ""} or "tailscaled.service" in cgroup
+
+
+def is_tailscale_ephemeral_port(port: int) -> bool:
+    return 32768 <= port <= 65535
+
+
+def read_ssh_config_text() -> str:
+    parts: list[str] = []
+    main = HOST_ROOT_PATH / "etc/ssh/sshd_config"
+    if main.exists():
+        parts.append(main.read_text(encoding="utf-8", errors="replace"))
+    dropin_dir = HOST_ROOT_PATH / "etc/ssh/sshd_config.d"
+    if dropin_dir.exists():
+        for path in sorted(dropin_dir.glob("*.conf")):
+            parts.append(path.read_text(encoding="utf-8", errors="replace"))
+    return "\n".join(parts)
+
+
+def config_has(pattern: str, text: str) -> bool:
+    return re.search(pattern, text, flags=re.IGNORECASE | re.MULTILINE) is not None
+
+
+def collect_security_findings() -> list[SecurityFinding]:
+    findings: list[SecurityFinding] = []
+    listeners = read_listening_tcp_ports()
+    risky_ports = {
+        139: "Samba NetBIOS is listening.",
+        445: "Samba SMB is listening.",
+        3389: "XRDP/RDP is listening.",
+        3391: "GNOME Remote Desktop is listening.",
+        11434: "Ollama local model API is listening.",
+    }
+
+    for listener in listeners:
+        address = str(listener["address"])
+        port = int(listener["port"])
+        if port in risky_ports:
+            findings.append(
+                SecurityFinding(
+                    id=f"risky-port-{port}",
+                    severity="high" if port in {139, 445, 3389, 3391} else "medium",
+                    title=f"Risky service port {port} is listening",
+                    evidence=f"{address}:{port} ({risky_ports[port]})",
+                    recommendation="Disable the service if not needed, or restrict it to Tailscale only.",
+                )
+            )
+        if is_global_listener(address) and port not in ALLOWED_GLOBAL_TCP_PORTS:
+            findings.append(
+                SecurityFinding(
+                    id=f"global-listener-{port}",
+                    severity="medium",
+                    title=f"TCP port {port} listens on all interfaces",
+                    evidence=f"{address}:{port}",
+                    recommendation="Bind the service to localhost or the Tailscale IP, or add a documented allowlist reason.",
+                )
+            )
+        if (
+            is_tailscale_listener(address)
+            and port not in ALLOWED_TAILSCALE_TCP_PORTS
+            and port != 39443
+            and not is_tailscale_daemon_listener(listener)
+            and not (IGNORE_TAILSCALE_EPHEMERAL_TCP_PORTS and is_tailscale_ephemeral_port(port))
+        ):
+            findings.append(
+                SecurityFinding(
+                    id=f"unexpected-tailscale-listener-{port}",
+                    severity="low",
+                    title=f"Unexpected Tailscale listener on port {port}",
+                    evidence=f"{address}:{port}",
+                    recommendation="Confirm the service is expected and document it in the allowlist.",
+                )
+            )
+
+    ssh_config = read_ssh_config_text()
+    ssh_expectations = [
+        ("ssh-password-auth", r"^\s*PasswordAuthentication\s+no\s*$", "SSH password authentication should be disabled."),
+        ("ssh-root-login", r"^\s*PermitRootLogin\s+no\s*$", "SSH root login should be disabled."),
+        (
+            "ssh-keyboard-interactive",
+            r"^\s*KbdInteractiveAuthentication\s+no\s*$",
+            "SSH keyboard-interactive authentication should be disabled.",
+        ),
+        ("ssh-x11-forwarding", r"^\s*X11Forwarding\s+no\s*$", "SSH X11 forwarding should be disabled."),
+        ("ssh-allow-users", r"^\s*AllowUsers\s+kyonccw\s*$", "SSH should restrict login users."),
+    ]
+    for finding_id, pattern, message in ssh_expectations:
+        if not config_has(pattern, ssh_config):
+            findings.append(
+                SecurityFinding(
+                    id=finding_id,
+                    severity="medium",
+                    title=message,
+                    evidence="Expected directive was not found in sshd_config or sshd_config.d.",
+                    recommendation="Add the expected directive and validate with sshd -t before restarting SSH.",
+                )
+            )
+
+    if disk_usage_percent() >= DISK_ALERT_THRESHOLD_PERCENT:
+        findings.append(
+            SecurityFinding(
+                id="disk-threshold",
+                severity="medium",
+                title="Disk usage exceeds configured threshold",
+                evidence=f"Disk usage is {disk_usage_percent()}%.",
+                recommendation="Review backups, logs, and unused artifacts before deleting data.",
+            )
+        )
+
+    if not openclaw_gateway_ok():
+        findings.append(
+            SecurityFinding(
+                id="openclaw-gateway",
+                severity="high",
+                title="OpenClaw gateway is unreachable",
+                evidence=f"GET {OPENCLAW_GATEWAY_URL} failed.",
+                recommendation="Check openclaw-gateway systemd user service and logs.",
+            )
+        )
+
+    deduped: dict[str, SecurityFinding] = {}
+    for finding in findings:
+        deduped[finding.id] = finding
+    return sorted(deduped.values(), key=lambda item: ({"high": 0, "medium": 1, "low": 2}.get(item.severity, 3), item.id))
+
+
+def severity_counts_from_findings(findings: list[SecurityFinding]) -> dict[str, int]:
+    counts: dict[str, int] = defaultdict(int)
+    for finding in findings:
+        counts[finding.severity] += 1
+    return dict(sorted(counts.items()))
+
+
+def render_security_report(findings: list[SecurityFinding]) -> str:
+    generated = now_utc().isoformat()
+    lines = [
+        f"# Homelab Security Posture Report - {today_slug()}",
+        "",
+        f"Generated: {generated}",
+        f"Host: {HOST_LABEL}",
+        "",
+        "## Summary",
+        "",
+        f"- Findings: {len(findings)}",
+        f"- OpenClaw gateway reachable: {openclaw_gateway_ok()}",
+        f"- Disk usage: {disk_usage_percent()}%",
+        f"- Listening TCP sockets observed: {len(read_listening_tcp_ports())}",
+        "",
+        "## Findings",
+        "",
+    ]
+    if findings:
+        for finding in findings:
+            lines.extend(
+                [
+                    f"### [{finding.severity.upper()}] {finding.title}",
+                    "",
+                    f"- ID: `{finding.id}`",
+                    f"- Evidence: {finding.evidence}",
+                    f"- Recommendation: {finding.recommendation}",
+                    "",
+                ]
+            )
+    else:
+        lines.append("No open findings from the current local security posture check.")
+
+    lines.extend(
+        [
+            "",
+            "## OpenClaw Review Instructions",
+            "",
+            "- Treat this as a local posture review, not an incident conclusion.",
+            "- Confirm any medium/high finding against current service needs.",
+            "- If a finding is accepted risk, record the reason in the Human Decision section of the relevant review note.",
+        ]
+    )
+    return "\n".join(lines) + "\n"
+
+
+def write_security_posture_outputs(findings: list[SecurityFinding]) -> dict[str, Any]:
+    ensure_dirs()
+    report_path = OPENCLAW_SECURITY_DIR / "reports" / f"{today_slug()}-security-posture.md"
+    write_text_owned(report_path, render_security_report(findings))
+
+    open_notes = sorted((OPENCLAW_SECURITY_DIR / "inbox").glob("*.md"), key=lambda p: p.stat().st_mtime, reverse=True)
+    queue = {
+        "updated_at": now_utc().isoformat(),
+        "open_review_count": len(open_notes),
+        "open_reviews": [path.name for path in open_notes[:50]],
+        "finding_count": len(findings),
+        "finding_severity_counts": severity_counts_from_findings(findings),
+        "findings": [finding.model_dump() for finding in findings],
+        "daily_briefing": f"{today_slug()}.md",
+        "security_posture_report": report_path.name,
+    }
+    queue_path = OPENCLAW_SECURITY_DIR / "queue" / "queue.json"
+    write_text_owned(queue_path, json.dumps(queue, indent=2, ensure_ascii=False))
+
+    latest_lines = [
+        "# OpenClaw Security Queue",
+        "",
+        f"Updated: {queue['updated_at']}",
+        "",
+        f"- Open review notes: {queue['open_review_count']}",
+        f"- Security findings: {queue['finding_count']}",
+        f"- Daily briefing: `briefings/{queue['daily_briefing']}`",
+        f"- Security posture report: `reports/{queue['security_posture_report']}`",
+        "",
+        "## Current Findings",
+        "",
+    ]
+    if findings:
+        latest_lines.extend(f"- [{finding.severity}] {finding.title} (`{finding.id}`)" for finding in findings)
+    else:
+        latest_lines.append("- No current posture findings.")
+    latest_path = OPENCLAW_SECURITY_DIR / "latest.md"
+    write_text_owned(latest_path, "\n".join(latest_lines) + "\n")
+
+    events = read_events()
+    write_dashboard(events)
+    return {"report": str(report_path), "queue": str(queue_path), "latest": str(latest_path), "findings": queue["findings"]}
+
+
+def read_openclaw_queue() -> dict[str, Any]:
+    path = OPENCLAW_SECURITY_DIR / "queue" / "queue.json"
+    if not path.exists():
+        findings = collect_security_findings()
+        write_security_posture_outputs(findings)
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def process_security_posture_scan() -> dict[str, Any]:
+    findings = collect_security_findings()
+    outputs = write_security_posture_outputs(findings)
+    return {
+        "ok": True,
+        "finding_count": len(findings),
+        "severity_counts": severity_counts_from_findings(findings),
+        "outputs": outputs,
+    }
+
+
 def generate_daily_briefing(send_to_telegram: bool = False) -> Path:
     ensure_dirs()
     date = today_slug()
     events = [event for event in read_events() if str(event.get("created_at", "")).startswith(date)]
+    findings = collect_security_findings()
+    posture_outputs = write_security_posture_outputs(findings)
     severity_counts: dict[str, int] = defaultdict(int)
     category_counts: dict[str, int] = defaultdict(int)
     for event in events:
@@ -353,8 +734,10 @@ def generate_daily_briefing(send_to_telegram: bool = False) -> Path:
         "",
         f"- Events today: {len(events)}",
         f"- Open review notes: {len(open_notes)}",
+        f"- Security posture findings: {len(findings)}",
         f"- OpenClaw gateway reachable: {openclaw_gateway_ok()}",
         f"- Disk usage: {disk_usage_percent()}%",
+        f"- Security queue: `{Path(str(posture_outputs['queue'])).name}`",
         "",
         "## Severity Counts",
         "",
@@ -369,6 +752,13 @@ def generate_daily_briefing(send_to_telegram: bool = False) -> Path:
         lines.extend(f"- {category}: {count}" for category, count in sorted(category_counts.items()))
     else:
         lines.append("- No categories recorded today.")
+
+    lines.extend(["", "## Security Posture Findings", ""])
+    if findings:
+        for finding in findings:
+            lines.append(f"- [{finding.severity}] {finding.title} (`{finding.id}`)")
+    else:
+        lines.append("- No current posture findings.")
 
     lines.extend(["", "## Latest Events", ""])
     if events:
@@ -553,6 +943,48 @@ async def disk_monitor() -> None:
         await asyncio.sleep(DISK_CHECK_INTERVAL_SECONDS)
 
 
+async def security_posture_monitor() -> None:
+    global security_posture_last_alert_at
+    if not ENABLE_SECURITY_POSTURE_MONITOR:
+        return
+    while True:
+        try:
+            findings = collect_security_findings()
+            write_security_posture_outputs(findings)
+            actionable = [finding for finding in findings if finding.severity in {"high", "medium"}]
+            if actionable:
+                current = now_utc()
+                if (
+                    security_posture_last_alert_at is None
+                    or (current - security_posture_last_alert_at).total_seconds()
+                    > SECURITY_POSTURE_ALERT_COOLDOWN_SECONDS
+                ):
+                    security_posture_last_alert_at = current
+                    process_alert(
+                        Alert(
+                            title="Security posture findings need review",
+                            source=HOST_LABEL,
+                            severity="high" if any(f.severity == "high" for f in actionable) else "medium",
+                            category="posture",
+                            summary=f"{len(actionable)} medium/high local security posture findings are open.",
+                            evidence=[f"{finding.severity}: {finding.title}" for finding in actionable[:10]],
+                            unknowns=[
+                                "Whether any open finding is an accepted homelab risk.",
+                                "Whether the service exposure is temporary or still needed.",
+                            ],
+                            suggested_checks=[
+                                "Open security-alerts/latest.md in the OpenClaw workspace.",
+                                "Review security-alerts/reports for the full posture report.",
+                                "Close or document each finding after human review.",
+                            ],
+                            raw={"findings": [finding.model_dump() for finding in actionable]},
+                        )
+                    )
+        except Exception as exc:
+            print(f"security posture monitor error: {exc}", flush=True)
+        await asyncio.sleep(SECURITY_POSTURE_INTERVAL_SECONDS)
+
+
 @app.get("/")
 async def index() -> dict[str, Any]:
     return {
@@ -562,6 +994,8 @@ async def index() -> dict[str, Any]:
             "status": "/status",
             "generic_webhook": "/webhook/generic",
             "daily_briefing": "/briefing/daily",
+            "security_scan": "/scan/security",
+            "openclaw_queue": "/queue",
         },
         "openclaw_workspace": str(OPENCLAW_SECURITY_DIR),
     }
@@ -576,6 +1010,7 @@ async def health() -> dict[str, Any]:
         "auth_log_monitor_enabled": ENABLE_AUTH_LOG_MONITOR,
         "openclaw_monitor_enabled": ENABLE_OPENCLAW_MONITOR,
         "disk_monitor_enabled": ENABLE_DISK_MONITOR,
+        "security_posture_monitor_enabled": ENABLE_SECURITY_POSTURE_MONITOR,
         "openclaw_gateway_ok": openclaw_gateway_ok(),
         "openclaw_security_dir": str(OPENCLAW_SECURITY_DIR),
     }
@@ -585,9 +1020,12 @@ async def health() -> dict[str, Any]:
 async def status() -> dict[str, Any]:
     events = read_events()
     open_notes = list((OPENCLAW_SECURITY_DIR / "inbox").glob("*.md"))
+    queue_path = OPENCLAW_SECURITY_DIR / "queue" / "queue.json"
+    queue = json.loads(queue_path.read_text(encoding="utf-8")) if queue_path.exists() else None
     return {
         "events": len(events),
         "open_review_notes": len(open_notes),
+        "security_findings": queue.get("finding_count", 0) if queue else None,
         "openclaw_gateway_ok": openclaw_gateway_ok(),
         "disk_usage_percent": disk_usage_percent(),
         "latest_event": events[-1] if events else None,
@@ -611,6 +1049,18 @@ async def daily_briefing(
     require_secret(x_security_hub_secret)
     path = generate_daily_briefing(send_to_telegram=send_to_telegram)
     return {"ok": True, "briefing": str(path)}
+
+
+@app.post("/scan/security")
+async def security_scan(x_security_hub_secret: str | None = Header(default=None)) -> dict[str, Any]:
+    require_secret(x_security_hub_secret)
+    return process_security_posture_scan()
+
+
+@app.get("/queue")
+async def openclaw_queue(x_security_hub_secret: str | None = Header(default=None)) -> dict[str, Any]:
+    require_secret(x_security_hub_secret)
+    return read_openclaw_queue()
 
 
 def main() -> None:

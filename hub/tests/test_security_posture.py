@@ -1,0 +1,141 @@
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+from app import main
+
+
+def test_parse_tcp_ipv4_address() -> None:
+    address, port = main.parse_tcp_addr("0100007F", "1F9F", 4)
+
+    assert address == "127.0.0.1"
+    assert port == 8095
+
+
+def test_config_has_matches_case_insensitive_lines() -> None:
+    text = "PasswordAuthentication no\nPermitRootLogin no\n"
+
+    assert main.config_has(r"^\s*passwordauthentication\s+no\s*$", text)
+    assert not main.config_has(r"^\s*x11forwarding\s+no\s*$", text)
+
+
+def test_collect_security_findings_flags_risky_ports(monkeypatch) -> None:
+    monkeypatch.setattr(
+        main,
+        "read_listening_tcp_ports",
+        lambda: [
+            {"address": "0.0.0.0", "port": 445, "family": "tcp4"},
+            {"address": "100.77.103.17", "port": 8099, "family": "tcp4"},
+        ],
+    )
+    monkeypatch.setattr(
+        main,
+        "read_ssh_config_text",
+        lambda: "\n".join(
+            [
+                "PasswordAuthentication no",
+                "PermitRootLogin no",
+                "KbdInteractiveAuthentication no",
+                "X11Forwarding no",
+                "AllowUsers kyonccw",
+            ]
+        ),
+    )
+    monkeypatch.setattr(main, "disk_usage_percent", lambda: 20.0)
+    monkeypatch.setattr(main, "openclaw_gateway_ok", lambda: True)
+
+    findings = main.collect_security_findings()
+
+    assert any(finding.id == "risky-port-445" for finding in findings)
+    assert all(finding.id != "unexpected-tailscale-listener-8099" for finding in findings)
+
+
+def test_collect_security_findings_ignores_tailscale_daemon_dynamic_port(monkeypatch) -> None:
+    monkeypatch.setattr(main, "TAILSCALE_IP", "100.77.103.17")
+    monkeypatch.setattr(
+        main,
+        "read_listening_tcp_ports",
+        lambda: [
+            {
+                "address": "fd7a:115c:a1e0::3301:67a0",
+                "port": 60845,
+                "family": "tcp6",
+                "process": {"comm": "tailscaled", "cmdline": "/usr/sbin/tailscaled", "cgroup": "tailscaled.service"},
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        main,
+        "read_ssh_config_text",
+        lambda: "\n".join(
+            [
+                "PasswordAuthentication no",
+                "PermitRootLogin no",
+                "KbdInteractiveAuthentication no",
+                "X11Forwarding no",
+                "AllowUsers kyonccw",
+            ]
+        ),
+    )
+    monkeypatch.setattr(main, "disk_usage_percent", lambda: 20.0)
+    monkeypatch.setattr(main, "openclaw_gateway_ok", lambda: True)
+
+    findings = main.collect_security_findings()
+
+    assert findings == []
+
+
+def test_collect_security_findings_ignores_tailscale_ephemeral_port(monkeypatch) -> None:
+    monkeypatch.setattr(main, "TAILSCALE_IP", "100.77.103.17")
+    monkeypatch.setattr(main, "IGNORE_TAILSCALE_EPHEMERAL_TCP_PORTS", True)
+    monkeypatch.setattr(
+        main,
+        "read_listening_tcp_ports",
+        lambda: [{"address": "fd7a:115c:a1e0::3301:67a0", "port": 60845, "family": "tcp6"}],
+    )
+    monkeypatch.setattr(
+        main,
+        "read_ssh_config_text",
+        lambda: "\n".join(
+            [
+                "PasswordAuthentication no",
+                "PermitRootLogin no",
+                "KbdInteractiveAuthentication no",
+                "X11Forwarding no",
+                "AllowUsers kyonccw",
+            ]
+        ),
+    )
+    monkeypatch.setattr(main, "disk_usage_percent", lambda: 20.0)
+    monkeypatch.setattr(main, "openclaw_gateway_ok", lambda: True)
+
+    findings = main.collect_security_findings()
+
+    assert findings == []
+
+
+def test_write_security_posture_outputs_creates_queue(tmp_path, monkeypatch) -> None:
+    security_dir = tmp_path / "security-alerts"
+    dashboard_dir = tmp_path / "dashboard"
+    monkeypatch.setattr(main, "OPENCLAW_SECURITY_DIR", security_dir)
+    monkeypatch.setattr(main, "OPENCLAW_DASHBOARD_DIR", dashboard_dir)
+    monkeypatch.setattr(main, "openclaw_gateway_ok", lambda: True)
+    monkeypatch.setattr(main, "disk_usage_percent", lambda: 10.0)
+    monkeypatch.setattr(main, "read_listening_tcp_ports", lambda: [])
+
+    finding = main.SecurityFinding(
+        id="example",
+        severity="medium",
+        title="Example finding",
+        evidence="example evidence",
+        recommendation="example recommendation",
+    )
+
+    outputs = main.write_security_posture_outputs([finding])
+    queue = json.loads(Path(outputs["queue"]).read_text(encoding="utf-8"))
+
+    assert queue["finding_count"] == 1
+    assert queue["findings"][0]["id"] == "example"
+    assert (security_dir / "latest.md").exists()
+    assert (dashboard_dir / "security-alerts.json").exists()

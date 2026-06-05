@@ -9,6 +9,7 @@ services:
       - .env
     volumes:
       - /var/log/auth.log:/host/auth.log:ro
+      - /proc:/host-proc:ro
       - /:/host-root:ro
       - /home/kyonccw/.openclaw/workspace/security-alerts:/openclaw/security-alerts
       - /home/kyonccw/.openclaw/workspace/dashboard:/openclaw/dashboard
