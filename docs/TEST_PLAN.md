@@ -15,6 +15,7 @@ This project is tested as a homelab security workflow, not only as a web API.
 - A NIST CSF 2.0 scan creates:
   - `security-alerts/reports/YYYY-MM-DD-nist-csf-2.0-profile.md`
   - `security-alerts/queue/nist-csf-profile.json`
+  - `security-alerts/queue/nist-csf-gap-backlog.json`
   - NIST status fields in `security-alerts/queue/queue.json`
 - The daily briefing includes event counts, open review counts, and posture findings.
 - Unit tests pass inside the same Docker image used by the service.
@@ -36,6 +37,7 @@ The tests verify:
 - OpenClaw queue and dashboard JSON generation.
 - NIST CSF function coverage across GOVERN, IDENTIFY, PROTECT, DETECT, RESPOND, and RECOVER.
 - NIST CSF profile JSON generation.
+- NIST CSF Current/Target Profile fields and gap backlog priority sorting.
 
 ## Manual End-to-End Tests
 
@@ -57,6 +59,7 @@ Then confirm:
 - `~/.openclaw/workspace/security-alerts/events/events.jsonl` has the new event.
 - `~/.openclaw/workspace/security-alerts/queue/queue.json` is valid JSON.
 - `~/.openclaw/workspace/security-alerts/queue/nist-csf-profile.json` is valid JSON.
+- `~/.openclaw/workspace/security-alerts/queue/nist-csf-gap-backlog.json` is valid JSON.
 - `~/.openclaw/workspace/security-alerts/latest.md` gives OpenClaw a concise current queue.
 - Docker logs do not print secrets.
 

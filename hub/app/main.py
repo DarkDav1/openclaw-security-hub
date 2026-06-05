@@ -128,6 +128,11 @@ class NistCsfControl(BaseModel):
     category: str
     outcome: str
     status: str
+    target: str = ""
+    target_status: str = "met"
+    gap_priority: str = "none"
+    owner: str = "homelab owner"
+    due: str = "manual"
     evidence: list[str] = Field(default_factory=list)
     gap: str = ""
     next_action: str = ""
@@ -619,6 +624,33 @@ def severity_counts_from_findings(findings: list[SecurityFinding]) -> dict[str, 
     return dict(sorted(counts.items()))
 
 
+def existing_nist_queue_fields() -> dict[str, Any]:
+    profile_path = OPENCLAW_SECURITY_DIR / "queue" / "nist-csf-profile.json"
+    backlog_path = OPENCLAW_SECURITY_DIR / "queue" / "nist-csf-gap-backlog.json"
+    if not profile_path.exists():
+        return {}
+    try:
+        profile = json.loads(profile_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return {}
+    backlog: list[Any] = []
+    if backlog_path.exists():
+        try:
+            parsed_backlog = json.loads(backlog_path.read_text(encoding="utf-8"))
+            if isinstance(parsed_backlog, list):
+                backlog = parsed_backlog
+        except json.JSONDecodeError:
+            backlog = []
+    return {
+        "nist_csf_profile": profile_path.name,
+        "nist_csf_report": profile.get("report"),
+        "nist_csf_gap_backlog": backlog_path.name if backlog_path.exists() else profile.get("gap_backlog_file"),
+        "nist_csf_gap_count": len(backlog) if backlog else len(profile.get("gap_backlog", [])),
+        "nist_csf_status_counts": profile.get("status_counts"),
+        "nist_csf_tier_note": profile.get("tier_note"),
+    }
+
+
 def has_open_review_notes() -> bool:
     return any((OPENCLAW_SECURITY_DIR / "inbox").glob("*.md"))
 
@@ -639,13 +671,30 @@ def control(
     evidence: list[str],
     gap: str,
     next_action: str,
+    target: str = "",
+    target_status: str | None = None,
+    gap_priority: str | None = None,
+    due: str = "manual",
 ) -> NistCsfControl:
+    inferred_target_status = target_status or ("met" if status == "pass" else "gap")
+    inferred_priority = gap_priority
+    if inferred_priority is None:
+        inferred_priority = {
+            "fail": "high",
+            "warning": "medium",
+            "manual_review": "manual",
+            "pass": "none",
+        }.get(status, "manual")
     return NistCsfControl(
         id=identifier,
         function=function,
         category=category,
         outcome=outcome,
         status=status,
+        target=target or f"Target state for {identifier}: evidence supports this outcome or an owner-approved exception is recorded.",
+        target_status=inferred_target_status,
+        gap_priority=inferred_priority,
+        due=due,
         evidence=evidence,
         gap=gap,
         next_action=next_action,
@@ -891,14 +940,45 @@ def nist_csf_tier_note(controls: list[NistCsfControl]) -> str:
     return "Tier 2 moving toward Tier 3: repeatable monitoring exists; formal policy, roles, and recovery testing remain the main gaps."
 
 
+def nist_csf_gap_backlog(controls: list[NistCsfControl]) -> list[dict[str, Any]]:
+    priority_order = {"high": 0, "medium": 1, "manual": 2, "low": 3, "none": 4}
+    backlog = [
+        {
+            "id": item.id,
+            "function": item.function,
+            "category": item.category,
+            "current_status": item.status,
+            "target_status": item.target_status,
+            "gap_priority": item.gap_priority,
+            "owner": item.owner,
+            "due": item.due,
+            "gap": item.gap,
+            "next_action": item.next_action,
+        }
+        for item in controls
+        if item.target_status != "met"
+    ]
+    return sorted(backlog, key=lambda item: (priority_order.get(str(item["gap_priority"]), 9), str(item["id"])))
+
+
+def nist_function_summary(controls: list[NistCsfControl]) -> dict[str, dict[str, int]]:
+    summary: dict[str, dict[str, int]] = {}
+    for function in sorted({item.function for item in controls}):
+        items = [item for item in controls if item.function == function]
+        summary[function] = status_counts(items)
+    return summary
+
+
 def render_nist_csf_report(controls: list[NistCsfControl]) -> str:
     counts = status_counts(controls)
+    backlog = nist_csf_gap_backlog(controls)
     lines = [
         f"# NIST CSF 2.0 Aligned Homelab Assessment - {today_slug()}",
         "",
         f"Generated: {now_utc().isoformat()}",
         f"Host: {HOST_LABEL}",
         "Framework: NIST Cybersecurity Framework (CSF) 2.0",
+        "Profile model: Current Profile, Target Profile, Gap Backlog",
         "",
         "## Scope and Caveat",
         "",
@@ -909,11 +989,37 @@ def render_nist_csf_report(controls: list[NistCsfControl]) -> str:
         "",
         f"- Controls assessed: {len(controls)}",
         f"- Status counts: {json.dumps(counts, ensure_ascii=False)}",
+        f"- Gap backlog items: {len(backlog)}",
         f"- Tier note: {nist_csf_tier_note(controls)}",
         "",
-        "## Function Coverage",
+        "## Current and Target Profile",
+        "",
+        "Current Profile records what the homelab evidence supports today. Target Profile records the intended baseline for a repeatable, reviewable homelab security workflow.",
+        "",
+        f"- Current function summary: {json.dumps(nist_function_summary(controls), ensure_ascii=False)}",
+        "- Target baseline: no high or medium technical findings, documented accepted risks, reviewed governance assumptions, and tested recovery evidence.",
+        "",
+        "## Gap Backlog",
         "",
     ]
+    if backlog:
+        for item in backlog:
+            lines.extend(
+                [
+                    f"- [{item['gap_priority']}] {item['id']} ({item['function']}): {item['next_action']}",
+                ]
+            )
+    else:
+        lines.append("- No current target-profile gaps.")
+
+    lines.extend(
+        [
+            "",
+            "## Function Coverage",
+            "",
+        ]
+    )
+
     by_function: dict[str, list[NistCsfControl]] = defaultdict(list)
     for item in controls:
         by_function[item.function].append(item)
@@ -927,7 +1033,10 @@ def render_nist_csf_report(controls: list[NistCsfControl]) -> str:
                 f"### {item.id} - {item.function} / {item.category}",
                 "",
                 f"- Status: `{item.status}`",
+                f"- Target status: `{item.target_status}`",
+                f"- Gap priority: `{item.gap_priority}`",
                 f"- Outcome: {item.outcome}",
+                f"- Target: {item.target}",
                 f"- Gap: {item.gap or 'No current gap from available evidence.'}",
                 f"- Next action: {item.next_action}",
                 "- Evidence:",
@@ -942,16 +1051,29 @@ def write_nist_csf_outputs(controls: list[NistCsfControl]) -> dict[str, Any]:
     ensure_dirs()
     report_path = OPENCLAW_SECURITY_DIR / "reports" / f"{today_slug()}-nist-csf-2.0-profile.md"
     profile_path = OPENCLAW_SECURITY_DIR / "queue" / "nist-csf-profile.json"
+    backlog_path = OPENCLAW_SECURITY_DIR / "queue" / "nist-csf-gap-backlog.json"
+    backlog = nist_csf_gap_backlog(controls)
     data = {
         "updated_at": now_utc().isoformat(),
         "framework": "NIST CSF 2.0",
+        "profile_model": "current_target_gap",
         "status_counts": status_counts(controls),
+        "function_summary": nist_function_summary(controls),
         "tier_note": nist_csf_tier_note(controls),
+        "current_profile": [item.model_dump() for item in controls],
+        "target_profile": {
+            "name": "Homelab CSF target profile",
+            "baseline": "No high or medium technical findings, documented accepted risks, reviewed governance assumptions, and tested recovery evidence.",
+            "target_status": "met only when evidence supports the outcome or an accepted-risk note is recorded.",
+        },
+        "gap_backlog": backlog,
         "controls": [item.model_dump() for item in controls],
         "report": report_path.name,
+        "gap_backlog_file": backlog_path.name,
     }
     write_text_owned(report_path, render_nist_csf_report(controls))
     write_text_owned(profile_path, json.dumps(data, indent=2, ensure_ascii=False))
+    write_text_owned(backlog_path, json.dumps(backlog, indent=2, ensure_ascii=False))
     queue_path = OPENCLAW_SECURITY_DIR / "queue" / "queue.json"
     if queue_path.exists():
         queue = json.loads(queue_path.read_text(encoding="utf-8"))
@@ -959,12 +1081,21 @@ def write_nist_csf_outputs(controls: list[NistCsfControl]) -> dict[str, Any]:
             {
                 "nist_csf_profile": profile_path.name,
                 "nist_csf_report": report_path.name,
+                "nist_csf_gap_backlog": backlog_path.name,
+                "nist_csf_gap_count": len(backlog),
                 "nist_csf_status_counts": data["status_counts"],
                 "nist_csf_tier_note": data["tier_note"],
             }
         )
         write_text_owned(queue_path, json.dumps(queue, indent=2, ensure_ascii=False))
-    return {"report": str(report_path), "profile": str(profile_path), "status_counts": data["status_counts"], "tier_note": data["tier_note"]}
+    return {
+        "report": str(report_path),
+        "profile": str(profile_path),
+        "gap_backlog": str(backlog_path),
+        "gap_count": len(backlog),
+        "status_counts": data["status_counts"],
+        "tier_note": data["tier_note"],
+    }
 
 
 def process_nist_csf_scan() -> dict[str, Any]:
@@ -977,6 +1108,7 @@ def process_nist_csf_scan() -> dict[str, Any]:
         "framework": "NIST CSF 2.0",
         "control_count": len(controls),
         "status_counts": status_counts(controls),
+        "gap_count": len(nist_csf_gap_backlog(controls)),
         "tier_note": nist_csf_tier_note(controls),
         "outputs": outputs,
     }
@@ -1044,6 +1176,7 @@ def write_security_posture_outputs(findings: list[SecurityFinding]) -> dict[str,
         "daily_briefing": f"{today_slug()}.md",
         "security_posture_report": report_path.name,
     }
+    queue.update({key: value for key, value in existing_nist_queue_fields().items() if value is not None})
     queue_path = OPENCLAW_SECURITY_DIR / "queue" / "queue.json"
     write_text_owned(queue_path, json.dumps(queue, indent=2, ensure_ascii=False))
 
@@ -1117,6 +1250,7 @@ def generate_daily_briefing(send_to_telegram: bool = False) -> Path:
         f"- Open review notes: {len(open_notes)}",
         f"- Security posture findings: {len(findings)}",
         f"- NIST CSF status counts: {json.dumps(status_counts(nist_controls), ensure_ascii=False)}",
+        f"- NIST CSF gap backlog items: {len(nist_csf_gap_backlog(nist_controls))}",
         f"- OpenClaw gateway reachable: {openclaw_gateway_ok()}",
         f"- Disk usage: {disk_usage_percent()}%",
         f"- Security queue: `{Path(str(posture_outputs['queue'])).name}`",
@@ -1145,6 +1279,7 @@ def generate_daily_briefing(send_to_telegram: bool = False) -> Path:
 
     lines.extend(["", "## NIST CSF 2.0 Review", ""])
     lines.append(f"- Tier note: {nist_csf_tier_note(nist_controls)}")
+    lines.append(f"- Gap backlog items: {len(nist_csf_gap_backlog(nist_controls))}")
     lines.append("- Manual review items are expected because governance and recovery outcomes need human evidence.")
 
     lines.extend(["", "## Latest Events", ""])
@@ -1417,6 +1552,7 @@ async def status() -> dict[str, Any]:
         "open_review_notes": len(open_notes),
         "security_findings": queue.get("finding_count", 0) if queue else None,
         "nist_csf_status_counts": nist_profile.get("status_counts") if nist_profile else None,
+        "nist_csf_gap_count": len(nist_profile.get("gap_backlog", [])) if nist_profile else None,
         "nist_csf_tier_note": nist_profile.get("tier_note") if nist_profile else None,
         "openclaw_gateway_ok": openclaw_gateway_ok(),
         "disk_usage_percent": disk_usage_percent(),

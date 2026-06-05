@@ -11,7 +11,7 @@ It receives alerts, watches local SSH failures, checks the OpenClaw gateway, sca
 - Checks whether the OpenClaw gateway is reachable.
 - Checks root disk usage.
 - Scans local security posture from host `/proc`, SSH configuration, disk usage, and OpenClaw reachability.
-- Produces a NIST CSF 2.0-aligned homelab self-assessment with current evidence, gaps, and next actions.
+- Produces a NIST CSF 2.0-aligned Current/Target Profile with current evidence, gaps, priorities, and next actions.
 - Sends Telegram alerts.
 - Creates OpenClaw review notes in `~/.openclaw/workspace/security-alerts/inbox`.
 - Writes event history to `~/.openclaw/workspace/security-alerts/events/events.jsonl`.
@@ -20,7 +20,7 @@ It receives alerts, watches local SSH failures, checks the OpenClaw gateway, sca
 - Writes dashboard data to `~/.openclaw/workspace/dashboard/security-alerts.json`.
 - Generates daily security briefings in `~/.openclaw/workspace/security-alerts/briefings`.
 - Generates security posture reports in `~/.openclaw/workspace/security-alerts/reports`.
-- Generates NIST CSF 2.0 profile reports in `~/.openclaw/workspace/security-alerts/reports`.
+- Generates NIST CSF 2.0 profile reports and gap backlog files.
 
 ## Architecture
 
@@ -77,12 +77,19 @@ The CSF scan is a self-assessment for a personal homelab. It is not a certificat
 
 The scan maps available evidence to representative NIST CSF 2.0 outcomes across GOVERN, IDENTIFY, PROTECT, DETECT, RESPOND, and RECOVER. Automated evidence is used where possible. Governance, policy, and recovery outcomes are marked for manual review when they require human-owned evidence.
 
+The generated profile uses:
+
+- Current Profile: what the available homelab evidence supports today.
+- Target Profile: the intended baseline for a repeatable, reviewable homelab security workflow.
+- Gap Backlog: prioritized actions with owner, due field, gap text, and next action.
+
 ## Current Host Paths
 
 - Project: `~/openclaw-security-hub`
 - OpenClaw inbox: `~/.openclaw/workspace/security-alerts/inbox`
 - Security queue: `~/.openclaw/workspace/security-alerts/queue/queue.json`
 - NIST CSF profile JSON: `~/.openclaw/workspace/security-alerts/queue/nist-csf-profile.json`
+- NIST CSF gap backlog: `~/.openclaw/workspace/security-alerts/queue/nist-csf-gap-backlog.json`
 - Latest queue summary: `~/.openclaw/workspace/security-alerts/latest.md`
 - Security reports: `~/.openclaw/workspace/security-alerts/reports`
 - Briefings: `~/.openclaw/workspace/security-alerts/briefings`

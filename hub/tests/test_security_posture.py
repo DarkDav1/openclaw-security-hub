@@ -167,6 +167,8 @@ def test_collect_nist_csf_controls_covers_all_functions(monkeypatch) -> None:
     assert functions == {"GOVERN", "IDENTIFY", "PROTECT", "DETECT", "RESPOND", "RECOVER"}
     assert any(control.id == "DE.CM-01" and control.status == "pass" for control in controls)
     assert any(control.status == "manual_review" for control in controls)
+    assert all(control.target for control in controls)
+    assert any(control.target_status == "gap" for control in controls)
 
 
 def test_write_nist_csf_outputs_creates_profile_and_updates_queue(tmp_path, monkeypatch) -> None:
@@ -192,8 +194,77 @@ def test_write_nist_csf_outputs_creates_profile_and_updates_queue(tmp_path, monk
 
     outputs = main.write_nist_csf_outputs(controls)
     profile = json.loads(Path(outputs["profile"]).read_text(encoding="utf-8"))
+    backlog = json.loads(Path(outputs["gap_backlog"]).read_text(encoding="utf-8"))
     queue = json.loads(queue_path.read_text(encoding="utf-8"))
 
     assert profile["framework"] == "NIST CSF 2.0"
+    assert profile["profile_model"] == "current_target_gap"
     assert profile["status_counts"]["pass"] == 1
+    assert profile["target_profile"]["name"] == "Homelab CSF target profile"
+    assert backlog == []
     assert queue["nist_csf_profile"] == "nist-csf-profile.json"
+    assert queue["nist_csf_gap_backlog"] == "nist-csf-gap-backlog.json"
+
+
+def test_nist_csf_gap_backlog_prioritizes_failures() -> None:
+    controls = [
+        main.NistCsfControl(
+            id="GV.PO-01",
+            function="GOVERN",
+            category="Policy",
+            outcome="Policy is established.",
+            status="manual_review",
+            target_status="gap",
+            gap_priority="manual",
+            gap="Policy evidence is missing.",
+            next_action="Write policy.",
+        ),
+        main.NistCsfControl(
+            id="PR.PS-01",
+            function="PROTECT",
+            category="Platform Security",
+            outcome="Configuration management is applied.",
+            status="fail",
+            target_status="gap",
+            gap_priority="high",
+            gap="Global listener is open.",
+            next_action="Bind service to localhost.",
+        ),
+    ]
+
+    backlog = main.nist_csf_gap_backlog(controls)
+
+    assert [item["id"] for item in backlog] == ["PR.PS-01", "GV.PO-01"]
+
+
+def test_security_posture_queue_preserves_existing_nist_fields(tmp_path, monkeypatch) -> None:
+    security_dir = tmp_path / "security-alerts"
+    dashboard_dir = tmp_path / "dashboard"
+    monkeypatch.setattr(main, "OPENCLAW_SECURITY_DIR", security_dir)
+    monkeypatch.setattr(main, "OPENCLAW_DASHBOARD_DIR", dashboard_dir)
+    monkeypatch.setattr(main, "openclaw_gateway_ok", lambda: True)
+    monkeypatch.setattr(main, "disk_usage_percent", lambda: 10.0)
+    monkeypatch.setattr(main, "read_listening_tcp_ports", lambda: [])
+    main.ensure_dirs()
+    (security_dir / "queue" / "nist-csf-profile.json").write_text(
+        json.dumps(
+            {
+                "report": "2026-06-05-nist-csf-2.0-profile.md",
+                "status_counts": {"pass": 1},
+                "tier_note": "example tier",
+                "gap_backlog": [{"id": "GV.PO-01"}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (security_dir / "queue" / "nist-csf-gap-backlog.json").write_text(
+        json.dumps([{"id": "GV.PO-01"}]),
+        encoding="utf-8",
+    )
+
+    outputs = main.write_security_posture_outputs([])
+    queue = json.loads(Path(outputs["queue"]).read_text(encoding="utf-8"))
+
+    assert queue["nist_csf_profile"] == "nist-csf-profile.json"
+    assert queue["nist_csf_gap_count"] == 1
+    assert queue["nist_csf_tier_note"] == "example tier"
