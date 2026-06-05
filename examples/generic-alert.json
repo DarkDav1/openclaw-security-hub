@@ -1,0 +1,20 @@
+{
+  "title": "SSH login failures",
+  "source": "homelab-srv01",
+  "severity": "medium",
+  "category": "ssh",
+  "summary": "Repeated SSH login failures detected on the homelab node.",
+  "evidence": [
+    "5 failed login attempts in 5 minutes",
+    "No successful login included in this sample"
+  ],
+  "unknowns": [
+    "Whether any login later succeeded",
+    "Whether the source IP belongs to expected automation"
+  ],
+  "suggested_checks": [
+    "Review nearby auth.log entries",
+    "Confirm whether password SSH login is disabled",
+    "Record the final human decision in the OpenClaw review note"
+  ]
+}
